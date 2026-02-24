@@ -134,6 +134,8 @@ export interface ComposedLine {
     endOffset: number;
     /** Paragraph alignment for this line */
     alignment: TextAlignment;
+    /** Whether optical margin alignment is enabled for this line's paragraph */
+    opticalMargins?: boolean;
 }
 
 // ── Layout Results ──
@@ -210,6 +212,17 @@ export interface ParagraphStyle {
     maxConsecutiveHyphens: number;
     /** Knuth-Plass tolerance (higher = accept worse breaks) */
     tolerance: number;
+    /**
+     * Hz-program glyph scaling config.
+     * When set, glyphs are scaled horizontally within [minScale, maxScale]
+     * to improve line fitting. Set to null/undefined to disable.
+     */
+    hzProgram?: { minScale: number; maxScale: number } | null;
+    /**
+     * Optical margin alignment (hanging punctuation).
+     * When true, leading/trailing punctuation hangs slightly outside the column.
+     */
+    opticalMargins: boolean;
 }
 
 export interface CharacterStyle {
@@ -236,6 +249,8 @@ export const DEFAULT_PARAGRAPH_STYLE: ParagraphStyle = {
     hyphenation: false,
     maxConsecutiveHyphens: 3,
     tolerance: 2,
+    hzProgram: null, // disabled by default
+    opticalMargins: false,
 };
 
 export const DEFAULT_CHARACTER_STYLE: CharacterStyle = {

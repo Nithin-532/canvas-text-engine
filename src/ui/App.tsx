@@ -45,6 +45,8 @@ export function App() {
     const [showColumns, setShowColumns] = useState(true);
     const [showBaselines, setShowBaselines] = useState(false);
     const [tolerance, setTolerance] = useState(2);
+    const [opticalMargins, setOpticalMargins] = useState(false);
+    const [hzProgramEnabled, setHzProgramEnabled] = useState(false);
 
     // Initialize engine
     useEffect(() => {
@@ -421,6 +423,28 @@ export function App() {
                             onChange={(e) => setShowBaselines(e.target.checked)}
                         />
                         Show baselines
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--text-secondary)', cursor: 'pointer', marginTop: '6px' }}>
+                        <input
+                            type="checkbox"
+                            checked={opticalMargins}
+                            onChange={(e) => {
+                                setOpticalMargins(e.target.checked);
+                                updateStyle('para', { opticalMargins: e.target.checked });
+                            }}
+                        />
+                        Optical margins
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--text-secondary)', cursor: 'pointer', marginTop: '6px' }}>
+                        <input
+                            type="checkbox"
+                            checked={hzProgramEnabled}
+                            onChange={(e) => {
+                                setHzProgramEnabled(e.target.checked);
+                                updateStyle('para', { hzProgram: e.target.checked ? { minScale: 0.97, maxScale: 1.03 } : null });
+                            }}
+                        />
+                        Hz-program scaling
                     </label>
                 </div>
 

@@ -164,20 +164,29 @@ export class CanvasRenderer {
 
         for (const [key, groupGlyphs] of groups) {
             const [fontSpec, color] = key.split('|');
-            ctx.font = fontSpec!;
             ctx.fillStyle = color ?? '#000';
             ctx.textBaseline = 'alphabetic';
 
             for (const glyph of groupGlyphs) {
-                // For Canvas 2D, we render exactly the character the glyph came from,
-                // using the precise Knuth-Plass/HarfBuzz X/Y positioning.
-                // This breaks the browser's native text shaping because we're rendering
-                // character by character, which is EXACTLY what we want (true WYSWIYG layout).
-                if (glyph.char) {
-                    ctx.fillText(glyph.char, glyph.x, glyph.y);
+                const hasScale = Math.abs(glyph.scale - 1.0) > 0.001;
+
+                if (hasScale) {
+                    // Hz-program: apply horizontal scale around the glyph's x position
+                    ctx.save();
+                    ctx.translate(glyph.x, 0);
+                    ctx.scale(glyph.scale, 1.0);
+                    ctx.font = fontSpec!;
+                    if (glyph.char) {
+                        ctx.fillText(glyph.char, 0, glyph.y);
+                    }
+                    ctx.restore();
                 } else {
-                    // Fallback for control chars
-                    ctx.fillText(' ', glyph.x, glyph.y);
+                    ctx.font = fontSpec!;
+                    if (glyph.char) {
+                        ctx.fillText(glyph.char, glyph.x, glyph.y);
+                    } else {
+                        ctx.fillText(' ', glyph.x, glyph.y);
+                    }
                 }
             }
         }

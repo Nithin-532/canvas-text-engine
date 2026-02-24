@@ -289,8 +289,9 @@ function buildBox(
         startOffset: start + paraStartOffset,
         endOffset: end + paraStartOffset,
         style,
-        microStretch: 0,
-        microShrink: 0,
+        // Hz-program: each box can stretch/shrink up to 3% of its own width
+        microStretch: (widthPixels + trackingPixels) * 0.03,
+        microShrink: (widthPixels + trackingPixels) * 0.03,
     };
 }
 

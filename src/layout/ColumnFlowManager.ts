@@ -23,6 +23,8 @@ import type {
 } from '../types';
 import { FrameManager } from '../core/TextFrame';
 import { FontManager } from '../shaping/FontManager';
+import { computeLineScale, DEFAULT_HZ_CONFIG } from './GlyphScaler';
+import { getLeadingIndent, getTrailingIndent } from './OpticalMargins';
 
 /**
  * Extract the elements for a specific line from the break list.
@@ -170,6 +172,46 @@ export class ColumnFlowManager {
                         width: column.width,
                     };
 
+                    // Apply optical margin alignment indent if enabled
+                    // We peek the first/last glyph character of the line
+                    if ((line as any).opticalMargins && line.elements.length > 0) {
+                        // Find first printable char → outdent LEFT
+                        for (const el of line.elements) {
+                            if (el.type === 'box' && el.glyphs.length > 0) {
+                                const firstChar = el.glyphs[0]?.char ?? '';
+                                const firstGlyphWidth = this._fontManager.fontUnitsToPixels(
+                                    el.glyphs[0]!.glyph.xAdvance,
+                                    el.style.fontSize,
+                                    el.style.fontFamily,
+                                );
+                                const leadIndent = getLeadingIndent(firstChar, firstGlyphWidth);
+                                if (leadIndent > 0) {
+                                    (positionedLine as ComposedLine).startX -= leadIndent;
+                                    (positionedLine as ComposedLine).width += leadIndent;
+                                }
+                                break;
+                            }
+                        }
+                        // Find last printable char → outdent RIGHT
+                        for (let ei = line.elements.length - 1; ei >= 0; ei--) {
+                            const el = line.elements[ei]!;
+                            if (el.type === 'box' && el.glyphs.length > 0) {
+                                const lastGlyph = el.glyphs[el.glyphs.length - 1]!;
+                                const lastChar = lastGlyph.char ?? '';
+                                const lastGlyphWidth = this._fontManager.fontUnitsToPixels(
+                                    lastGlyph.glyph.xAdvance,
+                                    el.style.fontSize,
+                                    el.style.fontFamily,
+                                );
+                                const trailIndent = getTrailingIndent(lastChar, lastGlyphWidth);
+                                if (trailIndent > 0) {
+                                    (positionedLine as ComposedLine).width += trailIndent;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
                     // Apply justification to position individual glyphs
                     const lineGlyphs = this._positionGlyphs(
                         positionedLine,
@@ -286,6 +328,7 @@ export class ColumnFlowManager {
                 startOffset: lineStartOffset,
                 endOffset: lineEndOffset,
                 alignment: paraStyle.alignment,
+                opticalMargins: paraStyle.opticalMargins,
             });
 
             // Move start index past the break
@@ -317,14 +360,28 @@ export class ColumnFlowManager {
             (alignment === 'justify' && !isLastLine) ||
             alignment === 'forceJustify';
 
+        // — Hz-program glyph scaling —
+        // Compute the natural width of all boxes on this line
+        const naturalBoxWidth = elements
+            .filter(el => el.type === 'box')
+            .reduce((sum, el) => sum + (el.type === 'box' ? el.width : 0), 0);
+
+        // Determine the hz config from the line's paragraph style (stored on composedLine via alignment etc.)
+        // We use the line's adjustment ratio: if KP had to stretch/shrink a lot, apply hz scaling
+        const hzLineScale = computeLineScale(
+            naturalBoxWidth,
+            _columnWidth,
+            adjustmentRatio,
+            DEFAULT_HZ_CONFIG,
+        );
+        const lineScale = shouldJustify ? hzLineScale : 1.0;
+
         let x = startX;
 
         for (const el of elements) {
             if (el.type === 'box') {
                 // Position each glyph in this box
                 let glyphX = x;
-                let firstAdvance = 0; // Initialize firstAdvance
-                let firstGlyphX = 0; // Initialize firstGlyphX
 
                 for (const item of el.glyphs) {
                     const glyph = item.glyph;
@@ -355,10 +412,10 @@ export class ColumnFlowManager {
                         fontWeight: el.style.fontWeight,
                         fontStyle: el.style.fontStyle,
                         color: el.style.color,
-                        scale: 1.0,
+                        scale: lineScale, // hz-program scale factor
                     });
 
-                    glyphX += advance;
+                    glyphX += advance * lineScale;
                 }
                 x = glyphX;
             } else if (el.type === 'glue') {
