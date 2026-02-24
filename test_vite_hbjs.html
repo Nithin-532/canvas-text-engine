@@ -1,0 +1,11 @@
+<script type="module">
+import * as wild from "/node_modules/harfbuzzjs/hbjs.js";
+import def from "/node_modules/harfbuzzjs/hbjs.js";
+console.log("wild keys:", Object.keys(wild));
+console.log("def type:", typeof def);
+if (typeof def === 'function') {
+  console.log("def is function!");
+} else if (def) {
+  console.log("def keys:", Object.keys(def));
+}
+</script>
