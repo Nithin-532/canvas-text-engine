@@ -9,6 +9,8 @@
    ═══════════════════════════════════════════════════════════════ */
 
 import type { TextFrameConfig } from '../types';
+import type { Point } from '../geometry/Polygon';
+import { polygonXIntersections, intersectionsToIntervals } from '../geometry/Polygon';
 
 export class TextFrame {
     readonly id: string;
@@ -31,6 +33,8 @@ export class TextFrame {
     contentStartOffset: number = 0;
     /** The text offset in the Story where this frame's content ends */
     contentEndOffset: number = 0;
+    /** Optional polygon shape. When set, scanline intersection determines line widths */
+    polygon?: Point[];
 
     constructor(config: TextFrameConfig) {
         this.id = config.id;
@@ -42,6 +46,7 @@ export class TextFrame {
         this.columnGap = config.columnGap;
         this.nextFrameId = config.nextFrameId;
         this.prevFrameId = config.prevFrameId;
+        this.polygon = config.polygon;
     }
 
     /**
@@ -69,6 +74,47 @@ export class TextFrame {
     getColumnWidth(): number {
         const totalGapWidth = (this.columns - 1) * this.columnGap;
         return (this.width - totalGapWidth) / this.columns;
+    }
+
+    /**
+     * For polygon frames: get available horizontal intervals for a line at the given Y band.
+     * Falls back to AABB column geometry when no polygon is set.
+     *
+     * Returns [{x, width}] array — may have 0 entries if the line is outside the polygon,
+     * or multiple entries if exclusion carves out the middle.
+     */
+    getLineIntervals(y: number, lineHeight: number, columnIndex: number): Array<{ x: number; width: number }> {
+        if (!this.polygon) {
+            // Fallback: rectangular column geometry
+            const cols = this.getColumnGeometries();
+            const col = cols[columnIndex];
+            if (!col) return [];
+            return [{ x: col.x, width: col.width }];
+        }
+
+        // Polygon frame: use scanline intersection
+        const poly = { points: this.polygon };
+        const intervalsByRow: Array<{ x: number; width: number }>[] = [];
+        for (const scanY of [y + 1, y + lineHeight * 0.5, y + lineHeight - 1]) {
+            const xs = polygonXIntersections(poly, scanY);
+            intervalsByRow.push(intersectionsToIntervals(xs));
+        }
+
+        // Intersect across all samples
+        let result = intervalsByRow[0] ?? [];
+        for (let i = 1; i < intervalsByRow.length; i++) {
+            const b = intervalsByRow[i]!;
+            const next: Array<{ x: number; width: number }> = [];
+            for (const ia of result) {
+                for (const ib of b) {
+                    const left = Math.max(ia.x, ib.x);
+                    const right = Math.min(ia.x + ia.width, ib.x + ib.width);
+                    if (right > left) next.push({ x: left, width: right - left });
+                }
+            }
+            result = next;
+        }
+        return result;
     }
 
     /** Check if a point is inside this frame */
@@ -100,6 +146,7 @@ export class TextFrame {
             height: this.height,
             columns: this.columns,
             columnGap: this.columnGap,
+            polygon: this.polygon,
             nextFrameId: this.nextFrameId,
             prevFrameId: this.prevFrameId,
         };

@@ -182,11 +182,33 @@ export class LayoutEngine {
             };
         }
 
+        // Set wrap objects BEFORE compose so buildLineWidthFn works below.
+        this._flowManager.setWrapObjects(this._config.wrapObjects ?? []);
+
         // Accumulate all composed lines across all paragraphs
         let allLines: ComposedLine[] = [];
 
         for (const shaped of shapedParagraphs) {
-            const columnWidth = firstFrame.getColumnWidth();
+            const fullColumnWidth = firstFrame.getColumnWidth();
+
+            // Build a per-line width array that accounts for wrap exclusions and previous lines.
+            // Each line number (1-based) maps to the available width at the exact
+            // simulated Y position where that line will land.
+            const approxLineHeight = shaped.paragraphStyle.leading *
+                (shaped.runs[0]?.style.fontSize ?? this._config.defaultCharacterStyle.fontSize ?? 14);
+
+            const lineWidths = this._flowManager.buildLineWidthsForParagraph(
+                allLines,
+                this._frameManager,
+                firstFrame.id,
+                approxLineHeight
+            );
+
+            const lineWidthFn = (lineNumber: number) => {
+                const idx = Math.max(0, lineNumber - 1);
+                return lineWidths[idx] ?? fullColumnWidth;
+            };
+
             const elements = buildElements(
                 shaped,
                 (units, size, family) => this._fontManager.fontUnitsToPixels(units, size, family),
@@ -198,12 +220,13 @@ export class LayoutEngine {
             if (composerType === 'paragraph') {
                 breaks = this._paragraphComposer.compose(
                     elements,
-                    columnWidth,
+                    lineWidthFn,
                     shaped.paragraphStyle.tolerance,
                 );
             } else {
-                breaks = this._greedyComposer.compose(elements, columnWidth);
+                breaks = this._greedyComposer.compose(elements, lineWidthFn);
             }
+
 
             if (!breaks || breaks.length === 0) continue;
 
@@ -213,6 +236,7 @@ export class LayoutEngine {
         }
 
         // Distribute all lines across columns and frames in one continuous flow
+        // (wrap objects were already set above before composing)
         const result = this._flowManager.distribute(
             allLines,
             this._frameManager,

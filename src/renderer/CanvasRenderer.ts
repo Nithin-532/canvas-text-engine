@@ -11,7 +11,7 @@
    - Simple debugging (draw column outlines, baselines)
    ═══════════════════════════════════════════════════════════════ */
 
-import type { LayoutResult, PositionedGlyph, ColumnLayout } from '../types';
+import type { LayoutResult, PositionedGlyph, ColumnLayout, WrapObject } from '../types';
 import type { TextFrame } from '../core/TextFrame';
 
 export interface RenderConfig {
@@ -26,6 +26,8 @@ export interface RenderConfig {
     showBaselines: boolean;
     /** Show glyph bounding boxes (debug) */
     showGlyphBoxes: boolean;
+    /** Show wrap polygon outlines (debug) */
+    showWrapObjects: boolean;
     /** Canvas DPI scale (for retina) */
     dpiScale: number;
 }
@@ -37,6 +39,7 @@ const DEFAULT_RENDER_CONFIG: RenderConfig = {
     showColumns: true,
     showBaselines: false,
     showGlyphBoxes: false,
+    showWrapObjects: true,
     dpiScale: window.devicePixelRatio ?? 1,
 };
 
@@ -80,7 +83,7 @@ export class CanvasRenderer {
     /**
      * Render the complete layout result.
      */
-    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null): void {
+    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null, wrapObjects: WrapObject[] = []): void {
         const ctx = this._ctx;
         const { paperWidth, paperHeight, paperColor } = this._config;
 
@@ -105,6 +108,11 @@ export class CanvasRenderer {
                     this._drawColumnOutline(column);
                 }
             }
+        }
+
+        // Draw wrap object outlines (dashed) in debug mode
+        if (this._config.showWrapObjects && wrapObjects.length > 0) {
+            this._drawWrapObjects(wrapObjects);
         }
 
         // Draw baselines
@@ -140,6 +148,33 @@ export class CanvasRenderer {
                 }
             }
         }
+    }
+
+    /**
+     * Draw wrap object polygons as dashed outlines for debug visualization.
+     */
+    private _drawWrapObjects(wrapObjects: WrapObject[]): void {
+        const ctx = this._ctx;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 140, 0, 0.7)'; // Orange dashed
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+
+        for (const wo of wrapObjects) {
+            if (wo.wrapMode === 'none' || wo.polygon.length < 3) continue;
+            ctx.beginPath();
+            ctx.moveTo(wo.polygon[0]!.x, wo.polygon[0]!.y);
+            for (let i = 1; i < wo.polygon.length; i++) {
+                ctx.lineTo(wo.polygon[i]!.x, wo.polygon[i]!.y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+
+            // Also fill lightly
+            ctx.fillStyle = 'rgba(255, 140, 0, 0.08)';
+            ctx.fill();
+        }
+        ctx.restore();
     }
 
     /**
@@ -265,7 +300,8 @@ export class CanvasRenderer {
                 isAfter = true;
             }
             if (caretGlyph) {
-                const x = isAfter ? caretGlyph.x + caretGlyph.fontSize * 0.5 : caretGlyph.x;
+                // Use actual glyph advance for pixel-perfect cursor placement
+                const x = isAfter ? caretGlyph.x + caretGlyph.advance : caretGlyph.x;
                 ctx.fillStyle = '#2563eb'; // blue-600
                 ctx.fillRect(x - 1, caretGlyph.y - caretGlyph.fontSize * 0.8, 2, caretGlyph.fontSize);
             }
@@ -344,5 +380,89 @@ export class CanvasRenderer {
     dispose(): void {
         // Canvas 2D has no explicit cleanup, but clear references
         this._fontCache.clear();
+    }
+
+    /**
+     * Draw the in-progress polygon being created by the user.
+     * Call this AFTER render() to overlay on top of everything.
+     *
+     * @param points     Already-placed vertices (canvas coords)
+     * @param cursorPt   Current mouse position for preview line (canvas coords, or null)
+     * @param snapRadius Radius in px at which cursor "snaps" to close the polygon
+     */
+    drawPolygonInProgress(
+        points: { x: number; y: number }[],
+        cursorPt: { x: number; y: number } | null,
+        snapRadius = 10,
+    ): void {
+        if (points.length === 0) return;
+        const ctx = this._ctx;
+        ctx.save();
+
+        const FILL_OPACITY = 0.12;
+        const STROKE_COLOR = 'rgba(99, 202, 183, 0.95)';   // teal
+        const VERTEX_COLOR = '#63cab7';
+        const PREVIEW_COLOR = 'rgba(99, 202, 183, 0.5)';
+        const SNAP_COLOR = '#facc15'; // yellow snap indicator
+
+        // Check if cursor is near start (polygon can close)
+        const canClose = cursorPt && points.length >= 3 &&
+            Math.hypot(cursorPt.x - points[0]!.x, cursorPt.y - points[0]!.y) <= snapRadius;
+
+        // Fill area (only when 3+ points placed)
+        if (points.length >= 3) {
+            ctx.beginPath();
+            ctx.moveTo(points[0]!.x, points[0]!.y);
+            for (let i = 1; i < points.length; i++) ctx.lineTo(points[i]!.x, points[i]!.y);
+            if (canClose && cursorPt) ctx.closePath();
+            ctx.fillStyle = `rgba(99, 202, 183, ${FILL_OPACITY})`;
+            ctx.fill();
+        }
+
+        // Draw edges between placed vertices
+        ctx.strokeStyle = STROKE_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(points[0]!.x, points[0]!.y);
+        for (let i = 1; i < points.length; i++) ctx.lineTo(points[i]!.x, points[i]!.y);
+        ctx.stroke();
+
+        // Preview edge from last vertex to cursor
+        if (cursorPt) {
+            ctx.strokeStyle = PREVIEW_COLOR;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 4]);
+            ctx.beginPath();
+            ctx.moveTo(points[points.length - 1]!.x, points[points.length - 1]!.y);
+            ctx.lineTo(cursorPt.x, cursorPt.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // Draw vertices
+        for (let i = 0; i < points.length; i++) {
+            const pt = points[i]!;
+            const isFirst = i === 0;
+            const snap = isFirst && canClose;
+
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, snap ? 7 : (isFirst ? 5 : 4), 0, Math.PI * 2);
+            ctx.fillStyle = snap ? SNAP_COLOR : VERTEX_COLOR;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        // Snap label
+        if (canClose) {
+            ctx.fillStyle = SNAP_COLOR;
+            ctx.font = '11px sans-serif';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText('close', points[0]!.x + 10, points[0]!.y - 4);
+        }
+
+        ctx.restore();
     }
 }

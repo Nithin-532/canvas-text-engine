@@ -153,6 +153,8 @@ export interface PositionedGlyph {
     color: string;
     /** Glyph scaling factor for hz-program (1.0 = no scaling) */
     scale: number;
+    /** Actual pixel advance width of this glyph (for cursor positioning) */
+    advance: number;
 }
 
 export interface ColumnLayout {
@@ -266,6 +268,20 @@ export const DEFAULT_CHARACTER_STYLE: CharacterStyle = {
 
 // ── Document Model ──
 
+/**
+ * A wrap exclusion object — text flows around this polygon.
+ * Page coordinates (px).
+ */
+export interface WrapObject {
+    id: string;
+    /** Absolute page coordinates of the wrap boundary polygon */
+    polygon: Array<{ x: number; y: number }>;
+    /** Extra clearance around the polygon (px) */
+    padding: number;
+    /** How text wraps: 'around' = route around, 'none' = ignore */
+    wrapMode: 'around' | 'none';
+}
+
 export interface TextFrameConfig {
     id: string;
     x: number;
@@ -274,6 +290,9 @@ export interface TextFrameConfig {
     height: number;
     columns: number;
     columnGap: number;
+    /** Optional polygon shape — if set, text flows inside this polygon
+     *  instead of the AABB rect. Coordinates are in page/canvas px. */
+    polygon?: Array<{ x: number; y: number }>;
     /** ID of next frame in thread (null = end of thread) */
     nextFrameId: string | null;
     /** ID of previous frame in thread (null = start of thread) */
@@ -284,6 +303,8 @@ export interface EngineConfig {
     frames: TextFrameConfig[];
     defaultParagraphStyle: ParagraphStyle;
     defaultCharacterStyle: CharacterStyle;
+    /** Wrap exclusion objects (text routes around these) */
+    wrapObjects?: WrapObject[];
     /** Paper dimensions for display */
     paperWidth: number;
     paperHeight: number;
