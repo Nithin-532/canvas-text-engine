@@ -1,0 +1,2 @@
+// Wait... if R is 255, G is 0, B is 0, this means only the Red channel has a distance of 1.0. This happens if the MSDF generator only outputs a Single-channel SDF, but stores it in RGBA format (as a red grayscale image). If it's single channel SDF, R=255 means background distance is maximum inside the shape, but wait! A standard SDF background distance is 0 outside.
+// Let's modify the msdf.frag to use `texture(u_msdfAtlas, v_uv).r` instead of `median()`.

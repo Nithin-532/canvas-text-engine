@@ -28,6 +28,8 @@ export interface RenderConfig {
     showGlyphBoxes: boolean;
     /** Show wrap polygon outlines (debug) */
     showWrapObjects: boolean;
+    /** Whether to draw text glyphs (set false if using WebGL backbuffer) */
+    drawText: boolean;
     /** Canvas DPI scale (for retina) */
     dpiScale: number;
 }
@@ -40,6 +42,7 @@ const DEFAULT_RENDER_CONFIG: RenderConfig = {
     showBaselines: false,
     showGlyphBoxes: false,
     showWrapObjects: true,
+    drawText: true,
     dpiScale: window.devicePixelRatio ?? 1,
 };
 
@@ -83,13 +86,33 @@ export class CanvasRenderer {
     /**
      * Render the complete layout result.
      */
-    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null, wrapObjects: WrapObject[] = []): void {
+    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null, wrapObjects: WrapObject[] = [], webglCanvas?: HTMLCanvasElement, zoom: number = 1): void {
         const ctx = this._ctx;
         const { paperWidth, paperHeight, paperColor } = this._config;
 
+        // Resize backing store for zoom so we get more pixels, not CSS upscaling
+        const targetW = Math.round(paperWidth * zoom);
+        const targetH = Math.round(paperHeight * zoom);
+        if (this._canvas.width !== targetW || this._canvas.height !== targetH) {
+            this._canvas.width = targetW;
+            this._canvas.height = targetH;
+        }
+
+        // Apply zoom transform — all drawing uses layout coordinates,
+        // but renders into the zoomed pixel buffer for crisp output
+        ctx.setTransform(zoom, 0, 0, zoom, 0, 0);
+
         // Clear canvas with paper background
-        ctx.fillStyle = paperColor;
-        ctx.fillRect(0, 0, paperWidth, paperHeight);
+        if (this._config.drawText || webglCanvas) {
+            ctx.fillStyle = paperColor;
+            ctx.fillRect(0, 0, paperWidth, paperHeight);
+        } else {
+            ctx.clearRect(0, 0, paperWidth, paperHeight);
+        }
+
+        if (webglCanvas) {
+            ctx.drawImage(webglCanvas, 0, 0, paperWidth, paperHeight);
+        }
 
         // Draw selection first so it's behind text
         if (selection) {
@@ -182,6 +205,7 @@ export class CanvasRenderer {
      * Groups glyphs by font to minimize context state changes.
      */
     private _renderGlyphs(glyphs: PositionedGlyph[]): void {
+        if (!this._config.drawText) return;
         const ctx = this._ctx;
 
         // Group by font key for efficient rendering

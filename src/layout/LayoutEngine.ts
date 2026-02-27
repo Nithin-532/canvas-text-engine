@@ -223,6 +223,12 @@ export class LayoutEngine {
                     lineWidthFn,
                     shaped.paragraphStyle.tolerance,
                 );
+
+                // Fallback: If Knuth-Plass fails (e.g., polygon slot is narrower than a single word),
+                // use Greedy so we don't drop the paragraph entirely.
+                if (!breaks || breaks.length === 0) {
+                    breaks = this._greedyComposer.compose(elements, lineWidthFn);
+                }
             } else {
                 breaks = this._greedyComposer.compose(elements, lineWidthFn);
             }

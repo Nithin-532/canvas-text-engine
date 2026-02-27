@@ -8,6 +8,11 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { LayoutEngine } from '../layout/LayoutEngine';
 import { CanvasRenderer } from '../renderer/CanvasRenderer';
+import { WebGLRenderer } from '../renderer/WebGLRenderer';
+import { WebGPURenderer, isWebGPUAvailable } from '../renderer/WebGPURenderer';
+import type { IGPURenderer } from '../renderer/GPURendererInterface';
+import { MSDFAtlasGenerator } from '../renderer/MSDFAtlasGenerator';
+import type { MSDFAtlas } from '@zappar/msdf-generator';
 import type { LayoutResult, ComposerType, TextAlignment, WrapObject } from '../types';
 import { DEFAULT_ENGINE_CONFIG } from '../types';
 import { makeEllipsePolygon } from '../geometry/Polygon';
@@ -18,7 +23,15 @@ The term typography is also applied to the style, arrangement, and appearance of
 
 Typography also may be used as an ornamental and decorative device, unrelated to the communication of information. Typography is the work of typesetters (also known as compositors), typographers, graphic designers, art directors, manga artists, comic book artists, and, now, anyone who arranges words, letters, numbers, and symbols for publication, display, or distribution.
 
-Until the Digital Age, typography was a specialized occupation. Digitization opened up typography to new generations of previously unrelated designers and lay users. As the capability to create typography has become ubiquitous, the application of principles and best practices developed over generations of skilled workers and professionals has diminished.`;
+Until the Digital Age, typography was a specialized occupation. Digitization opened up typography to new generations of previously unrelated designers and lay users. As the capability to create typography has become ubiquitous, the application of principles and best practices developed over generations of skilled workers and professionals has diminished.
+
+In contemporary use, the practice and study of typography are very broad, covering all aspects of letter design and application, both mechanical (typesetting, type design, and typefaces) and manual (handwriting and calligraphy). Typography is applied to the style, arrangement, and appearance of the letters, numbers, and symbols created by the process.
+
+Good typography is measured by how well it spells out the message it is trying to convey. In this digital age, attention spans are short and information is abundant. If your text is difficult to read because of poor typographic choices, your audience will move on. Contrast, hierarchy, grid systems, and white space are your tools. Use them wisely to guide the reader's eye and create a harmonious composition.
+
+A key element of typography is choosing the right typeface. Serif fonts, with their small decorative strokes, often convey tradition, reliability, and formality. Sans-serif fonts, lacking these strokes, are seen as modern, clean, and approachable. The choice depends entirely on the context and the audience. Mixing typefaces can create visual interest but should be done with care to avoid a cluttered or confusing appearance.
+
+Remember that typography is not just about legibility; it is also about conveying emotion and tone. A delicate script font will evoke a very different feeling than a heavy, geometric display font. The best typographers understand this and use type as a powerful tool for communication and expression.`;
 
 // ── Polygon tool types ──────────────────────────────────────────
 interface ManagedPolygon {
@@ -35,9 +48,14 @@ function newPolyId() { return `poly-${_nextPolyId++}`; }
 const SNAP_RADIUS = 12; // px, distance to first vertex that closes polygon
 
 export function App() {
-    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const uiCanvasRef = useRef<HTMLCanvasElement>(null);
+
     const engineRef = useRef<LayoutEngine | null>(null);
-    const rendererRef = useRef<CanvasRenderer | null>(null);
+    const uiRendererRef = useRef<CanvasRenderer | null>(null);
+    const gpuRendererRef = useRef<IGPURenderer | null>(null);
+    const msdfGenRef = useRef<MSDFAtlasGenerator | null>(null);
+    const atlasRef = useRef<MSDFAtlas | null>(null);
+    const [gpuBackend, setGpuBackend] = useState<'webgl' | 'webgpu'>('webgl');
 
     const [status, setStatus] = useState<string>('Initializing...');
     const [statusDot, setStatusDot] = useState<'loading' | 'ok' | 'error'>('loading');
@@ -45,8 +63,15 @@ export function App() {
     const [selection, setSelection] = useState<[number, number] | null>(null);
     const [isDragging, setIsDragging] = useState(false);
 
+    // ── Zoom / Pan state ────────────────────────────────────────
+    const [zoom, setZoom] = useState(1.0);
+    const [panX, setPanX] = useState(0);
+    const [panY, setPanY] = useState(0);
+    const [isPanning, setIsPanning] = useState(false);
+    const panStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
     // ── Typography/Layout Controls ──────────────────────────────
-    const [columns, setColumns] = useState(2);
+    const [columns, setColumns] = useState(6);
     const [fontSize, setFontSize] = useState(14);
     const [leading, setLeading] = useState(1.4);
     const [fontWeight, setFontWeight] = useState<number>(400);
@@ -63,7 +88,22 @@ export function App() {
     const [hzProgramEnabled, setHzProgramEnabled] = useState(false);
 
     // ── Polygon / Wrap state ────────────────────────────────────
-    const [polygons, setPolygons] = useState<ManagedPolygon[]>([]);
+    const [polygons, setPolygons] = useState<ManagedPolygon[]>([
+        {
+            id: 'poly-initial-1',
+            label: 'Center Circle',
+            points: makeEllipsePolygon(600, 400, 200, 200).points,
+            padding: 15,
+            enabled: true,
+        },
+        {
+            id: 'poly-initial-2',
+            label: 'Bottom Left Triangle',
+            points: [{ x: 60, y: 800 }, { x: 400, y: 800 }, { x: 60, y: 500 }],
+            padding: 25,
+            enabled: true,
+        }
+    ]);
     const [drawMode, setDrawMode] = useState(false);
     const [drawPoints, setDrawPoints] = useState<{ x: number; y: number }[]>([]);
     const [cursorPt, setCursorPt] = useState<{ x: number; y: number } | null>(null);
@@ -81,18 +121,29 @@ export function App() {
         [polygons]
     );
 
-    // ── Helpers to read canvas-relative coords ─────────────────
+    // ── Helpers to read canvas-relative coords (zoom/pan aware) ─
     const canvasPoint = useCallback((clientX: number, clientY: number) => {
-        const rect = canvasRef.current?.getBoundingClientRect();
+        const rect = uiCanvasRef.current?.getBoundingClientRect();
         if (!rect) return null;
-        return { x: clientX - rect.left, y: clientY - rect.top };
-    }, []);
+        // The canvas inside a CSS-transformed container:
+        // rect already reflects the zoomed size, so dividing by zoom gives layout coords
+        const x = (clientX - rect.left) / zoom;
+        const y = (clientY - rect.top) / zoom;
+        return { x, y };
+    }, [zoom]);
 
     // ── Recompose + render ──────────────────────────────────────
+    // Keep zoom in a ref so recompose doesn't depend on it (zoom is visual-only)
+    const zoomRef = useRef(zoom);
+    zoomRef.current = zoom;
+
     const recompose = useCallback((wraps?: WrapObject[]) => {
         const engine = engineRef.current;
-        const renderer = rendererRef.current;
-        if (!engine || !renderer || engine.status.state !== 'ready') return;
+        const uiRenderer = uiRendererRef.current;
+        const glRenderer = gpuRendererRef.current;
+        const currentZoom = zoomRef.current;
+
+        if (!engine || !uiRenderer || !glRenderer || engine.status.state !== 'ready') return;
 
         const wrapObjects = wraps ?? activeWrapObjects;
 
@@ -105,16 +156,41 @@ export function App() {
             wrapObjects,
         });
 
-        renderer.updateConfig({ showColumns, showBaselines });
+        uiRenderer.updateConfig({ showColumns, showBaselines, drawText: false });
 
         const result = engine.compose();
         setLayoutResult(result);
-        renderer.render(result, engine.frameManager.allFrames, selection, wrapObjects);
+
+        // Render MSDF text on bottom layer
+        glRenderer.setTransform(currentZoom, 0, 0);
+        glRenderer.render(result, atlasRef.current);
+
+        // Render UI overlays on top layer, drawing the WebGL offscreen canvas onto it first
+        uiRenderer.render(result, engine.frameManager.allFrames, selection, wrapObjects, glRenderer.getCanvas(), currentZoom);
 
         setStatus(`Ready — ${result.lineCount} lines in ${result.composeTimeMs.toFixed(1)}ms`);
         setStatusDot('ok');
         return result;
     }, [columns, columnGap, showColumns, showBaselines, selection, activeWrapObjects]);
+
+    // Re-render (without recomposing layout) when zoom changes
+    useEffect(() => {
+        const glRenderer = gpuRendererRef.current;
+        const uiRenderer = uiRendererRef.current;
+        const engine = engineRef.current;
+        if (!glRenderer || !uiRenderer || !engine || !layoutResult) return;
+
+        glRenderer.setTransform(zoom, 0, 0);
+        glRenderer.render(layoutResult, atlasRef.current);
+        uiRenderer.render(
+            layoutResult,
+            engine.frameManager.allFrames,
+            selection,
+            activeWrapObjects,
+            glRenderer.getCanvas(),
+            zoom
+        );
+    }, [zoom, layoutResult, selection, activeWrapObjects]);
 
 
     const updateStyle = useCallback((type: 'char' | 'para', partialStyle: any) => {
@@ -207,17 +283,70 @@ export function App() {
                 engine.story.applyCharacterStyle(124, 135, { color: '#27ae60' });
                 engine.story.applyCharacterStyle(236, 243, { color: '#8e44ad' });
                 engine.story.applyCharacterStyle(250, 258, { color: '#e67e22' });
-                if (canvasRef.current) {
-                    const renderer = new CanvasRenderer(canvasRef.current, {
+                // Initialize MSDF Generator and gather necessary charset
+                msdfGenRef.current = new MSDFAtlasGenerator();
+                await msdfGenRef.current.init();
+
+                // For MVP, generate a static atlas containing all ASCII + specific chars used.
+                const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:",./<>? \'’—';
+                const robotoBlob = await (await fetch('https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf')).arrayBuffer();
+
+                atlasRef.current = await msdfGenRef.current.generateAtlas(robotoBlob, charset, 4, [1024, 1024]);
+
+                if (uiCanvasRef.current) {
+                    const uiRenderer = new CanvasRenderer(uiCanvasRef.current, {
                         paperWidth: config.paperWidth,
                         paperHeight: config.paperHeight,
                         showColumns,
                         showBaselines,
+                        drawText: false, // Text is handled by WebGL
                     });
-                    rendererRef.current = renderer;
+                    uiRendererRef.current = uiRenderer;
+
+                    // Create an off-DOM canvas for GPU rendering
+                    const offscreenCanvas = document.createElement('canvas');
+                    offscreenCanvas.width = config.paperWidth;
+                    offscreenCanvas.height = config.paperHeight;
+
+                    // Try WebGPU first, fall back to WebGL
+                    let gpuRenderer: IGPURenderer;
+                    if (isWebGPUAvailable()) {
+                        setStatus('Initializing WebGPU...');
+                        const webgpuRenderer = new WebGPURenderer(offscreenCanvas, {
+                            paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
+                            paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
+                        });
+                        const ok = await webgpuRenderer.init();
+                        if (ok) {
+                            gpuRenderer = webgpuRenderer;
+                            setGpuBackend('webgpu');
+                        } else {
+                            // WebGPU init failed, fall back
+                            gpuRenderer = new WebGLRenderer(offscreenCanvas, {
+                                paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
+                                paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
+                            });
+                            setGpuBackend('webgl');
+                        }
+                    } else {
+                        gpuRenderer = new WebGLRenderer(offscreenCanvas, {
+                            paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
+                            paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
+                        });
+                        setGpuBackend('webgl');
+                    }
+
+                    // Upload the generated MSDF atlas texture
+                    gpuRenderer.setAtlas(atlasRef.current);
+
+                    gpuRendererRef.current = gpuRenderer;
+
+                    // Initial layout compose
                     const result = engine.compose();
                     setLayoutResult(result);
-                    renderer.render(result, engine.frameManager.allFrames);
+
+                    recompose();
+
                     setStatus(`Ready — ${result.lineCount} lines in ${result.composeTimeMs.toFixed(1)}ms`);
                     setStatusDot('ok');
                 }
@@ -238,15 +367,19 @@ export function App() {
 
     // Re-render when selection changes
     useEffect(() => {
-        if (rendererRef.current && engineRef.current && layoutResult) {
-            rendererRef.current.render(
+        if (uiRendererRef.current && gpuRendererRef.current && engineRef.current && layoutResult) {
+            gpuRendererRef.current.setTransform(zoom, 0, 0);
+            gpuRendererRef.current.render(layoutResult, atlasRef.current);
+            uiRendererRef.current.render(
                 layoutResult,
                 engineRef.current.frameManager.allFrames,
                 selection,
                 activeWrapObjects,
+                gpuRendererRef.current.getCanvas(),
+                zoom
             );
             if (drawPoints.length > 0) {
-                rendererRef.current.drawPolygonInProgress(drawPoints, cursorPt, SNAP_RADIUS);
+                uiRendererRef.current.drawPolygonInProgress(drawPoints, cursorPt, SNAP_RADIUS);
             }
         }
         if (engineRef.current && selection) {
@@ -265,7 +398,7 @@ export function App() {
                 setTolerance(paraStyle.tolerance);
             }
         }
-    }, [selection, layoutResult, activeWrapObjects, drawPoints, cursorPt]);
+    }, [selection, layoutResult, activeWrapObjects, drawPoints, cursorPt, zoom]);
 
     // ── Canvas draw-mode pointer handlers ───────────────────────
     const handleCanvasPointerDown = useCallback((e: React.PointerEvent) => {
@@ -278,7 +411,7 @@ export function App() {
             if (offset !== -1) {
                 setSelection([offset, offset]);
                 setIsDragging(true);
-                canvasRef.current?.setPointerCapture(e.pointerId);
+                uiCanvasRef.current?.setPointerCapture(e.pointerId);
             } else {
                 setSelection(null);
             }
@@ -307,13 +440,15 @@ export function App() {
         if (drawMode) {
             const pt = canvasPoint(e.clientX, e.clientY);
             setCursorPt(pt);
-            // Re-draw overlay live
-            if (layoutResult && rendererRef.current && engineRef.current) {
-                rendererRef.current.render(
-                    layoutResult, engineRef.current.frameManager.allFrames, selection, activeWrapObjects
+            // Re-draw overlay live (must pass WebGL canvas to avoid black screen)
+            if (layoutResult && uiRendererRef.current && engineRef.current) {
+                uiRendererRef.current.render(
+                    layoutResult, engineRef.current.frameManager.allFrames, selection, activeWrapObjects,
+                    gpuRendererRef.current?.getCanvas(),
+                    zoom
                 );
                 if (drawPoints.length > 0) {
-                    rendererRef.current.drawPolygonInProgress(drawPoints, pt, SNAP_RADIUS);
+                    uiRendererRef.current.drawPolygonInProgress(drawPoints, pt, SNAP_RADIUS);
                 }
             }
             return;
@@ -389,6 +524,22 @@ export function App() {
             else if (start < story.length) { story.delete(start, 1); setSelection([start, start]); }
             recompose(); return;
         }
+        // Zoom keyboard shortcuts
+        if ((e.metaKey || e.ctrlKey) && (e.key === '=' || e.key === '+')) {
+            e.preventDefault();
+            setZoom(z => Math.min(4.0, z * 1.25));
+            return;
+        }
+        if ((e.metaKey || e.ctrlKey) && e.key === '-') {
+            e.preventDefault();
+            setZoom(z => Math.max(1.0, z / 1.25));
+            return;
+        }
+        if ((e.metaKey || e.ctrlKey) && e.key === '0') {
+            e.preventDefault();
+            setZoom(1.0); setPanX(0); setPanY(0);
+            return;
+        }
         if (e.metaKey || e.ctrlKey || e.altKey) return;
         if (e.key.length === 1 || e.key === 'Enter') {
             e.preventDefault();
@@ -400,8 +551,95 @@ export function App() {
         }
     }, [drawMode, drawPoints, cancelDraw, finishPolygon, selection, recompose]);
 
+    // ── Zoom / Pan handlers ──────────────────────────────────────
+    // Use a ref to track zoom/pan for zoom-to-cursor math (avoids stale closures)
+    const zoomPanRef = useRef({ zoom, panX, panY });
+    zoomPanRef.current = { zoom, panX, panY };
+
+    const handleWheel = useCallback((e: WheelEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const state = zoomPanRef.current;
+        if (e.ctrlKey || e.metaKey) {
+            // Ctrl+scroll = zoom centered on cursor
+            const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            const oldZoom = state.zoom;
+            const newZoom = Math.min(4.0, Math.max(1.0, oldZoom * factor));
+            if (newZoom === oldZoom) return;
+
+            const main = (e.target as HTMLElement).closest('.canvas-area');
+            if (main) {
+                const mainRect = main.getBoundingClientRect();
+                const mx = e.clientX - mainRect.left;
+                const my = e.clientY - mainRect.top;
+                const layoutX = (mx - state.panX) / oldZoom;
+                const layoutY = (my - state.panY) / oldZoom;
+                const rawPanX = mx - layoutX * newZoom;
+                const rawPanY = my - layoutY * newZoom;
+                setPanX(rawPanX);
+                setPanY(rawPanY);
+                zoomPanRef.current.panX = rawPanX;
+                zoomPanRef.current.panY = rawPanY;
+            }
+            setZoom(newZoom);
+            zoomPanRef.current.zoom = newZoom;
+        } else {
+            // Plain scroll = pan
+            const rawPanX = state.panX - e.deltaX * 0.5;
+            const rawPanY = state.panY - e.deltaY * 0.5;
+            setPanX(rawPanX);
+            setPanY(rawPanY);
+            zoomPanRef.current.panX = rawPanX;
+            zoomPanRef.current.panY = rawPanY;
+        }
+    }, []);
+
+    // Register wheel handler on document in CAPTURE phase with { passive: false }
+    useEffect(() => {
+        const docHandler = (e: WheelEvent) => {
+            const target = e.target as HTMLElement;
+            if (!target?.closest?.('.canvas-area')) return;
+            handleWheel(e);
+        };
+        document.addEventListener('wheel', docHandler, { passive: false, capture: true });
+        return () => document.removeEventListener('wheel', docHandler, { capture: true });
+    }, [handleWheel]);
+
+    const handlePanPointerDown = useCallback((e: React.PointerEvent) => {
+        // Middle mouse button (button 1) starts panning
+        if (e.button === 1) {
+            e.preventDefault();
+            setIsPanning(true);
+            panStartRef.current = { x: e.clientX, y: e.clientY, panX, panY };
+            (e.target as HTMLElement).setPointerCapture(e.pointerId);
+        }
+    }, [panX, panY]);
+
+    const handlePanPointerMove = useCallback((e: React.PointerEvent) => {
+        if (isPanning && panStartRef.current) {
+            const dx = e.clientX - panStartRef.current.x;
+            const dy = e.clientY - panStartRef.current.y;
+            setPanX(panStartRef.current.panX + dx);
+            setPanY(panStartRef.current.panY + dy);
+        }
+    }, [isPanning]);
+
+    const handlePanPointerUp = useCallback((e: React.PointerEvent) => {
+        if (e.button === 1 && isPanning) {
+            setIsPanning(false);
+            panStartRef.current = null;
+            try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch { }
+        }
+    }, [isPanning]);
+
+    const resetZoomPan = useCallback(() => {
+        setZoom(1.0);
+        setPanX(0);
+        setPanY(0);
+    }, []);
+
     // ── Cursor style ────────────────────────────────────────────
-    const canvasCursor = drawMode ? 'crosshair' : 'text';
+    const canvasCursor = isPanning ? 'grabbing' : drawMode ? 'crosshair' : 'text';
 
     // ── Render ──────────────────────────────────────────────────
     return (
@@ -572,19 +810,37 @@ export function App() {
             <main
                 className="canvas-area"
                 tabIndex={0}
-                style={{ outline: 'none' }}
+                style={{ outline: 'none', position: 'relative', overflow: 'hidden' }}
                 onKeyDown={handleKeyDown}
-                onPointerDown={handleCanvasPointerDown}
-                onPointerMove={handleCanvasPointerMove}
+                onPointerDown={(e) => { handlePanPointerDown(e); if (e.button !== 1) handleCanvasPointerDown(e); }}
+                onPointerMove={(e) => { handlePanPointerMove(e); if (!isPanning) handleCanvasPointerMove(e); }}
                 onPointerUp={(e) => {
-                    if (!drawMode) {
+                    handlePanPointerUp(e);
+                    if (!drawMode && e.button === 0) {
                         setIsDragging(false);
-                        try { canvasRef.current?.releasePointerCapture(e.pointerId); } catch { }
+                        try { uiCanvasRef.current?.releasePointerCapture(e.pointerId); } catch { }
                     }
                 }}
                 onDoubleClick={handleCanvasDoubleClick}
             >
-                <canvas ref={canvasRef} style={{ touchAction: 'none', cursor: canvasCursor }} />
+                <div
+                    key="webgl-fix-remount"
+                    style={{
+                        position: 'relative',
+                        width: DEFAULT_ENGINE_CONFIG.paperWidth * zoom,
+                        height: DEFAULT_ENGINE_CONFIG.paperHeight * zoom,
+                        background: '#ffffff',
+                        boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
+                        overflow: 'hidden',
+                        marginLeft: panX,
+                        marginTop: panY,
+                    }}>
+                    {/* Only the Canvas2D is in the DOM to avoid compositing bugs. It will paint the WebGL output natively. */}
+                    <canvas
+                        ref={uiCanvasRef}
+                        style={{ position: 'absolute', top: 0, left: 0, width: DEFAULT_ENGINE_CONFIG.paperWidth * zoom, height: DEFAULT_ENGINE_CONFIG.paperHeight * zoom, zIndex: 2, touchAction: 'none', cursor: canvasCursor, pointerEvents: 'auto' }}
+                    />
+                </div>
             </main>
 
             {/* Status Bar */}
@@ -599,11 +855,23 @@ export function App() {
                 <div className="status-bar__item">
                     {composer === 'paragraph' ? 'Knuth-Plass' : 'Greedy'} Composer
                 </div>
+                <div className="status-bar__item" style={{ opacity: 0.7, fontSize: '11px' }}>
+                    {gpuBackend === 'webgpu' ? '🟢 WebGPU' : '🔵 WebGL'}
+                </div>
                 {drawMode && (
                     <div className="status-bar__item" style={{ color: '#63cab7', fontWeight: 600 }}>
                         ✏ Polygon Draw — {drawPoints.length} vertices placed
                     </div>
                 )}
+                <div className="status-bar__item" style={{ marginLeft: 'auto' }}>
+                    <span style={{ opacity: 0.7, fontSize: '11px' }}>{Math.round(zoom * 100)}%</span>
+                    {zoom !== 1.0 && (
+                        <button
+                            onClick={resetZoomPan}
+                            style={{ marginLeft: '6px', background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '3px', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '10px', padding: '1px 4px' }}
+                        >Reset</button>
+                    )}
+                </div>
             </footer>
         </div>
     );

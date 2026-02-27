@@ -342,40 +342,67 @@ export class GreedyComposer {
             const elementWidth = el.type === 'box' || el.type === 'glue' ? el.width : 0;
 
             // Check if adding this element exceeds the limit
-            if (currentWidth + elementWidth > getLineWidth(breaks.length + 1) && currentWidth > 0) {
-                // We must break.
-                if (lastBreakOpportunity !== -1) {
-                    // Break at the last opportunity
-                    breaks.push({
-                        breakIndex: lastBreakOpportunity,
-                        adjustmentRatio: 0,
-                        fitnessClass: 1,
-                        totalDemerits: 0
-                    });
+            if (currentWidth + elementWidth > getLineWidth(breaks.length + 1)) {
+                if (currentWidth === 0) {
+                    // If we are at the beginning of a line and the element *itself* is wider than the slot,
+                    // it means the slot is just too narrow (likely next to a polygon wrap object).
+                    // We peek ahead to see if the polygon clears up giving us a wider slot.
+                    let foundWiderSlot = false;
+                    for (let peek = 1; peek <= 20; peek++) {
+                        if (getLineWidth(breaks.length + 1 + peek) >= elementWidth) {
+                            foundWiderSlot = true;
+                            break;
+                        }
+                    }
 
-                    // The line is now broken at lastBreakOpportunity.
-                    // We must re-process elements from lastBreakOpportunity + 1.
-                    // Easiest robust way is to reset loop index.
-                    i = lastBreakOpportunity;
-                    currentWidth = 0;
-                    lastBreakOpportunity = -1;
+                    if (foundWiderSlot) {
+                        // Skip this narrow line entirely by emitting an empty break
+                        breaks.push({
+                            breakIndex: i > 0 ? i - 1 : 0,
+                            adjustmentRatio: 0,
+                            fitnessClass: 1,
+                            totalDemerits: 0
+                        });
+                        i--; // Re-evaluate this element for the new (next) line
+                        continue;
+                    }
+                    // If no wider slot is coming up, just force it here and let it geometrically overflow.
+                    // We do nothing else so currentWidth += elementWidth happens below.
                 } else {
-                    // No break opportunity found on this line! A very long word.
-                    // We MUST break at current index i-1 (or i if it's the very first element) to push this long element to the next line.
-                    const forceBreakIndex = i > 0 ? i - 1 : i;
-                    breaks.push({
-                        breakIndex: forceBreakIndex,
-                        adjustmentRatio: 0,
-                        fitnessClass: 1,
-                        totalDemerits: 0
-                    });
-                    i = forceBreakIndex;
-                    currentWidth = 0;
-                    lastBreakOpportunity = -1;
+                    // We must break.
+                    if (lastBreakOpportunity !== -1) {
+                        // Break at the last opportunity
+                        breaks.push({
+                            breakIndex: lastBreakOpportunity,
+                            adjustmentRatio: 0,
+                            fitnessClass: 1,
+                            totalDemerits: 0
+                        });
+
+                        // The line is now broken at lastBreakOpportunity.
+                        // We must re-process elements from lastBreakOpportunity + 1.
+                        i = lastBreakOpportunity;
+                        currentWidth = 0;
+                        lastBreakOpportunity = -1;
+                        continue;
+                    } else {
+                        // No break opportunity found on this line! A very long word spanning multiple elements.
+                        const forceBreakIndex = i > 0 ? i - 1 : i;
+                        breaks.push({
+                            breakIndex: forceBreakIndex,
+                            adjustmentRatio: 0,
+                            fitnessClass: 1,
+                            totalDemerits: 0
+                        });
+                        i = forceBreakIndex;
+                        currentWidth = 0;
+                        lastBreakOpportunity = -1;
+                        continue;
+                    }
                 }
-            } else {
-                currentWidth += elementWidth;
             }
+
+            currentWidth += elementWidth;
         }
 
         // Add a final break for any remaining elements if the paragraph didn't end with a forced penalty

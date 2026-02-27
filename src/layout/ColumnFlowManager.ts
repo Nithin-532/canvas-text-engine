@@ -73,8 +73,6 @@ function pickBestSlot(
     columnX: number,
     columnWidth: number,
 ): { x: number; width: number } | null {
-    if (intervals.length === 0) return { x: columnX, width: columnWidth };
-
     // Ignore tiny slivers that can't realistically fit text
     const MIN_SLOT_WIDTH = 30;
     const usable = intervals.filter(iv => iv.width >= MIN_SLOT_WIDTH);
@@ -266,6 +264,18 @@ export class ColumnFlowManager {
                     if (currentY + line.lineHeight > col.y + col.height) {
                         break; // Move to next column
                     }
+
+                    if (this._wrapPolygons.length > 0) {
+                        const intervals = this._scanlineEngine.getRectIntervals(
+                            col.x, col.width, this._wrapPolygons, currentY, line.lineHeight,
+                        );
+                        const slot = pickBestSlot(intervals, col.x, col.width);
+                        if (!slot) {
+                            currentY += line.lineHeight;
+                            continue; // Band occluded, advance Y but don't consume a line
+                        }
+                    }
+
                     currentY += line.lineHeight;
                     lineIdx++;
                 }
@@ -411,7 +421,10 @@ export class ColumnFlowManager {
             .reduce((sum, el) => sum + (el.type === 'box' ? el.width : 0), 0);
 
         const hzLineScale = computeLineScale(naturalBoxWidth, _columnWidth, adjustmentRatio, DEFAULT_HZ_CONFIG);
-        const lineScale = shouldJustify ? hzLineScale : 1.0;
+
+        // If the layout engine squeezed this line (adjustmentRatio < 0) to fit a narrow bounds,
+        // we MUST apply the shrink scaling even if we are left-aligned, otherwise it visually overflows.
+        const lineScale = (shouldJustify || adjustmentRatio < 0) ? hzLineScale : 1.0;
 
         let x = startX;
 
@@ -444,10 +457,10 @@ export class ColumnFlowManager {
                 x = glyphX;
             } else if (el.type === 'glue') {
                 let adjustedWidth = el.width;
-                if (shouldJustify) {
+                if (shouldJustify || adjustmentRatio < 0) {
                     adjustedWidth = adjustmentRatio >= 0
                         ? el.width + adjustmentRatio * el.stretch
-                        : el.width + adjustmentRatio * el.shrink;
+                        : el.width + (adjustmentRatio * el.shrink);
                 }
                 x += adjustedWidth;
             }

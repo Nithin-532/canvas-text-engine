@@ -6,6 +6,9 @@
       "DOM",
       "DOM.Iterable"
     ],
+    "types": [
+      "@webgpu/types"
+    ],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",
