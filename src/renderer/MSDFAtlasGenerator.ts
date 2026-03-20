@@ -62,8 +62,7 @@ export class MSDFAtlasGenerator {
         return await this._msdf.generateAtlas({
             font: fontArray,
             charset,
-            type: 'msdf',         // REQUIRED: Tell generator to build Multi-channel SDF
-            distanceRange: fieldRange,
+            fieldRange: fieldRange,
             textureSize,
             fontSize: 42, // Default size for the SDF generation (balancing detail vs atlas size)
         });

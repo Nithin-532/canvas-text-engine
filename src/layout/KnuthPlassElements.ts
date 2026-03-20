@@ -268,11 +268,20 @@ function buildBox(
     if (!style) return null;
 
     // Calculate total width in pixels
-    const widthFontUnits = boxGlyphs.reduce((sum, g) => sum + g.glyph.xAdvance, 0);
-    const widthPixels = fontUnitsToPixels(widthFontUnits, style.fontSize, style.fontFamily, style.fontWeight, style.fontStyle);
+    let widthPixels = 0;
+    let isInlineObject = false;
 
-    // Add tracking if specified
-    const trackingPixels = style.tracking ? style.tracking * style.fontSize * (end - start - 1) : 0;
+    for (const bg of boxGlyphs) {
+        if (bg.glyph.isInlineObject) {
+            widthPixels += bg.glyph.xAdvance; // Already in exact pixels
+            isInlineObject = true;
+        } else {
+            widthPixels += fontUnitsToPixels(bg.glyph.xAdvance, style.fontSize, style.fontFamily, style.fontWeight, style.fontStyle);
+        }
+    }
+
+    // Add tracking if specified (inline objects don't get tracking)
+    const trackingPixels = (style.tracking && !isInlineObject) ? style.tracking * style.fontSize * (end - start - 1) : 0;
 
     const paraStartOffset = runs.length > 0 ? runs[0]!.startOffset : 0;
 
@@ -289,9 +298,10 @@ function buildBox(
         startOffset: start + paraStartOffset,
         endOffset: end + paraStartOffset,
         style,
-        // Hz-program: each box can stretch/shrink up to 3% of its own width
-        microStretch: (widthPixels + trackingPixels) * 0.03,
-        microShrink: (widthPixels + trackingPixels) * 0.03,
+        // Hz-program: only standard text can stretch/shrink
+        microStretch: isInlineObject ? 0 : (widthPixels + trackingPixels) * 0.03,
+        microShrink: isInlineObject ? 0 : (widthPixels + trackingPixels) * 0.03,
+        isInlineObject,
     };
 }
 

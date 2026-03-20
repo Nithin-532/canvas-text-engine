@@ -127,11 +127,14 @@ export class FontManager {
         // Shape!
         buffer.shape(loaded.font);
 
+        // Map HarfBuzz UTF-8 byte indices to JS UTF-16 code units
+        const clusterMap = buildUtf8ToUtf16Map(text);
+
         // Extract results
         const glyphInfos = buffer.json();
         const shapedGlyphs: ShapedGlyph[] = glyphInfos.map((info) => ({
             glyphId: info.GlyphId,
-            cluster: info.Cluster,
+            cluster: clusterMap[info.Cluster] ?? info.Cluster,
             xAdvance: info.XAdvance,
             yAdvance: info.YAdvance,
             xOffset: info.XOffset,
@@ -220,4 +223,60 @@ export class FontManager {
         this._isReady = false;
         this._initPromise = null;
     }
+}
+
+/**
+ * Maps HarfBuzz UTF-8 byte indices back to JavaScript UTF-16 code unit indices.
+ */
+function buildUtf8ToUtf16Map(text: string): Int32Array {
+    let byteLen = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        if (c < 0x80) byteLen += 1;
+        else if (c < 0x800) byteLen += 2;
+        else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < text.length) {
+            const nextC = text.charCodeAt(i + 1);
+            if (nextC >= 0xDC00 && nextC <= 0xDFFF) {
+                byteLen += 4;
+                i++;
+            } else {
+                byteLen += 3;
+            }
+        } else {
+            byteLen += 3;
+        }
+    }
+
+    const map = new Int32Array(byteLen + 1);
+    let byteIndex = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        map[byteIndex] = i;
+
+        if (c < 0x80) {
+            byteIndex += 1;
+        } else if (c < 0x800) {
+            map[byteIndex + 1] = i;
+            byteIndex += 2;
+        } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < text.length) {
+            const nextC = text.charCodeAt(i + 1);
+            if (nextC >= 0xDC00 && nextC <= 0xDFFF) {
+                map[byteIndex + 1] = i;
+                map[byteIndex + 2] = i;
+                map[byteIndex + 3] = i;
+                byteIndex += 4;
+                i++; // Skip tail surrogate
+            } else {
+                map[byteIndex + 1] = i;
+                map[byteIndex + 2] = i;
+                byteIndex += 3;
+            }
+        } else {
+            map[byteIndex + 1] = i;
+            map[byteIndex + 2] = i;
+            byteIndex += 3;
+        }
+    }
+    map[byteIndex] = text.length;
+    return map;
 }

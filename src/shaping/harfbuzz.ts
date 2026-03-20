@@ -80,7 +80,7 @@ class CString {
   readonly length: number;
 
   constructor(text: string) {
-    var bytes = hb.utf8Encoder.encode(text);
+    const bytes = hb.utf8Encoder.encode(text);
     this.ptr = hb.malloc(bytes.byteLength);
     hb.heapu8.set(bytes, this.ptr);
     this.length = bytes.byteLength;
@@ -178,7 +178,7 @@ export type HarfBuzzDirection = "ltr" | "rtl" | "ttb" | "btt"
 
 class GlyphInformation {
   readonly GlyphId: number
-  readonly Cluster: number
+  Cluster: number
   readonly XAdvance: number
   readonly YAdvance: number
   readonly XOffset: number
@@ -202,7 +202,7 @@ export class HarfBuzzBuffer {
   }
 
   addText(text: string) {
-    let str = new CString(text);
+    const str = new CString(text);
     hb.hb_buffer_add_utf8(this.ptr, str.ptr, str.length, 0, str.length);
     str.destroy();
   }
@@ -212,18 +212,18 @@ export class HarfBuzzBuffer {
   }
 
   setDirection(direction: HarfBuzzDirection) {
-    let d = { "ltr": 4, "rtl": 5, "ttb": 6, "btt": 7 }[direction];
+    const d = { "ltr": 4, "rtl": 5, "ttb": 6, "btt": 7 }[direction];
     hb.hb_buffer_set_direction(this.ptr, d);
   }
 
   json() {
-    var length = hb.hb_buffer_get_length(this.ptr);
-    var result = new Array<GlyphInformation>();
-    var infosPtr32 = hb.hb_buffer_get_glyph_infos(this.ptr, 0) / 4;
-    var positionsPtr32 = hb.hb_buffer_get_glyph_positions(this.ptr, 0) / 4;
-    var infos = hb.heapu32.subarray(infosPtr32, infosPtr32 + 5 * length);
-    var positions = hb.heapi32.subarray(positionsPtr32, positionsPtr32 + 5 * length);
-    for (var i = 0; i < length; ++i) {
+    const length = hb.hb_buffer_get_length(this.ptr);
+    const result = new Array<GlyphInformation>();
+    const infosPtr32 = hb.hb_buffer_get_glyph_infos(this.ptr, 0) / 4;
+    const positionsPtr32 = hb.hb_buffer_get_glyph_positions(this.ptr, 0) / 4;
+    const infos = hb.heapu32.subarray(infosPtr32, infosPtr32 + 5 * length);
+    const positions = hb.heapi32.subarray(positionsPtr32, positionsPtr32 + 5 * length);
+    for (let i = 0; i < length; ++i) {
       result.push(new GlyphInformation(
         infos[i * 5 + 0]!,
         infos[i * 5 + 2]!,
@@ -240,25 +240,94 @@ export class HarfBuzzBuffer {
   }
 
   shape(font: HarfBuzzFont) {
-    // harfbuzzjs currently ignores features array in this TS binding or passes 0
-    hb.hb_shape(font.ptr, this.ptr, 0, 0);
+    // Disable standard ligature substitutions (liga, clig) so individual character
+    // glyphs are preserved. Ligature codepoints may not be in the MSDF atlas.
+    // hb_feature_t struct: { tag: u32, value: u32, start: u32, end: u32 } = 16 bytes each
+    const HB_FEATURE_GLOBAL_END = 0xFFFFFFFF;
+    const features = [
+      { tag: 0x6C696761, value: 0 }, // liga = off
+      { tag: 0x636C6967, value: 0 }, // clig = off
+    ];
+    const featPtr = hb.malloc(features.length * 16);
+    const heap = hb.heapu32;
+    for (let i = 0; i < features.length; i++) {
+      const base = (featPtr >> 2) + i * 4;
+      heap[base + 0] = features[i]!.tag;
+      heap[base + 1] = features[i]!.value;
+      heap[base + 2] = 0;                  // start = 0
+      heap[base + 3] = HB_FEATURE_GLOBAL_END; // end = global
+    }
+    hb.hb_shape(font.ptr, this.ptr, featPtr, features.length);
+    hb.free(featPtr);
   }
 }
 
 export function shape(text: string, font: HarfBuzzFont): Array<GlyphInformation> {
-  let buffer = new HarfBuzzBuffer();
+  const buffer = new HarfBuzzBuffer();
   buffer.addText(text);
   buffer.guessSegmentProperties();
   buffer.shape(font);
-  let result = buffer.json();
+  const result = buffer.json();
   buffer.destroy();
+
+  // DEBUG: What does Harfbuzz return?
+  if (text.includes("Children younger") || text.includes("Possible side") || text.includes("Information on") || text.includes("1 year old")) {
+    console.log(`[HB DEBUG] text="${text}"`);
+    const mapped = result.map(info => ({
+      id: info.GlyphId,
+      cluster: info.Cluster,
+      charGuess: text[info.Cluster] ?? '?'
+    }));
+    console.log("[HB DEBUG] Raw Clusters:", mapped);
+  }
+
+  // HarfBuzz clusters are UTF-8 byte offsets because we use hb_buffer_add_utf8.
+  // JavaScript strings use UTF-16 indices. We MUST map the byte offset back to the JS string index
+  // exactly as TextEncoder generated the bytes.
+  let byteIndex = 0;
+  const byteToJs: number[] = [];
+  const enc = hb.utf8Encoder; // Reuse the encoder
+
+  for (let i = 0; i < text.length; i++) {
+    byteToJs[byteIndex] = i;
+
+    // Check if this is the start of a surrogate pair
+    let char = text[i]!;
+    if (i + 1 < text.length) {
+      const code = text.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        char += text[i + 1];
+        i++; // Skip the low surrogate so it counts as one character in JS
+      }
+    }
+
+    // Add the EXACT byte length that this character takes in UTF-8
+    // This flawlessly aligns with hb.utf8Encoder.encode(text)
+    // Note: We use enc.encode(char).length which is guaranteed to match.
+    // However, TextEncoder.encode allocates an array, which is slow.
+    // For a faster but safe fallback, use Buffer.byteLength or manual. 
+    // Here we use TextEncoder for correctness.
+    byteIndex += enc.encode(char).length;
+  }
+  byteToJs[byteIndex] = text.length;
+
+  for (const info of result) {
+    // Find the JS character index for this byte cluster.
+    // If it points slightly off (unlikely), find the nearest valid JS index going backwards.
+    let b = info.Cluster;
+    while (b >= 0 && byteToJs[b] === undefined) b--;
+    if (b >= 0) {
+      info.Cluster = byteToJs[b]!;
+    }
+  }
+
   return result;
 }
 
 export function getWidth(text: string, font: HarfBuzzFont, fontSizeInPixel: number): number {
-  let scale = fontSizeInPixel / font.unitsPerEM;
-  let shapeResult = shape(text, font);
-  let totalWidth = shapeResult.map((glyphInformation) => {
+  const scale = fontSizeInPixel / font.unitsPerEM;
+  const shapeResult = shape(text, font);
+  const totalWidth = shapeResult.map((glyphInformation) => {
     return glyphInformation.XAdvance;
   }).reduce((previous, current) => {
     return previous + current;
@@ -309,7 +378,6 @@ export function loadHarfbuzz(webAssemblyUrl: string): Promise<void> {
     return WebAssembly.instantiate(wasm, imports);
   }).then(result => {
     wasmExports = result.instance.exports;
-    //@ts-ignore
     hb = new HarfBuzzExports(result.instance.exports);
   });
 }
@@ -317,10 +385,10 @@ export function loadHarfbuzz(webAssemblyUrl: string): Promise<void> {
 export function loadAndCacheFont(fontName: string, fontUrl: string): Promise<void> {
   return fetch(fontUrl).then((response) => {
     return response.arrayBuffer().then((blob) => {
-      let fontBlob = new Uint8Array(blob);
-      let harfbuzzBlob = new HarfBuzzBlob(fontBlob);
-      let harfbuzzFace = new HarfBuzzFace(harfbuzzBlob, 0);
-      let harfbuzzFont = new HarfBuzzFont(harfbuzzFace);
+      const fontBlob = new Uint8Array(blob);
+      const harfbuzzBlob = new HarfBuzzBlob(fontBlob);
+      const harfbuzzFace = new HarfBuzzFace(harfbuzzBlob, 0);
+      const harfbuzzFont = new HarfBuzzFont(harfbuzzFace);
 
       harfbuzzFonts.set(fontName, harfbuzzFont);
       harfbuzzFace.destroy();

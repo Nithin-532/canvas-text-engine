@@ -2,6 +2,159 @@
    Shared Type Definitions — Rusty Text Engine
    ═══════════════════════════════════════════════════════════════ */
 
+// ── Constants ──
+
+export const OBJECT_REPLACEMENT_CHARACTER = '\uFFFC';
+
+// ── Table Styles (InDesign-quality) ──
+
+/** Row height mode — mirrors InDesign's "Exactly" / "At Least" paradigm */
+export type RowHeightMode = 'atLeast' | 'exactly';
+
+/** First baseline offset mode — mirrors InDesign's first baseline control */
+export type FirstBaselineOffset = 'ascent' | 'capHeight' | 'leading' | 'xHeight' | 'fixed';
+
+/** Cell content type — text or graphic placeholder */
+export type CellContentType = 'text' | 'graphic';
+
+/** Per-cell stroke configuration for selective border editing (stroke proxy) */
+export interface CellStrokeProxy {
+    top: { color: string; width: number } | null;
+    right: { color: string; width: number } | null;
+    bottom: { color: string; width: number } | null;
+    left: { color: string; width: number } | null;
+}
+
+/** Per-cell style: padding, fill, stroke, vertical text alignment */
+export interface CellStyle {
+    paddingTop: number;
+    paddingRight: number;
+    paddingBottom: number;
+    paddingLeft: number;
+    /** Background color (null = transparent) */
+    fillColor: string | null;
+    /** Border color (legacy - use strokeProxy for per-edge control) */
+    strokeColor: string;
+    /** Border width in px (legacy - use strokeProxy for per-edge control) */
+    strokeWidth: number;
+    /** Per-edge stroke configuration (null = use table-level inner/outer strokes) */
+    strokeProxy: CellStrokeProxy | null;
+    /** Vertical text alignment within the cell */
+    verticalAlign: 'top' | 'middle' | 'bottom' | 'justify';
+    /** First baseline offset mode */
+    firstBaselineOffset: FirstBaselineOffset;
+    /** Fixed offset value in px (used when firstBaselineOffset = 'fixed') */
+    firstBaselineMin: number;
+    /** Cell content type - text or graphic placeholder */
+    contentType: CellContentType;
+    /** Rotation angle in degrees (0, 90, 180, 270) for cell content */
+    rotation: 0 | 90 | 180 | 270;
+    /** Clip content to cell bounds (false = allow overflow visually) */
+    clipContent: boolean;
+}
+
+/** Alternating pattern mode */
+export type AlternatingMode = 'rows' | 'columns';
+
+/** Table-level style: header/footer rows, alternating fills, outer/inner strokes */
+export interface TableStyle {
+    /** Number of header rows (0 = none) */
+    headerRows: number;
+    /** Number of footer rows (0 = none) */
+    footerRows: number;
+    /** Background color for header rows */
+    headerFillColor: string | null;
+    /** Background color for footer rows */
+    footerFillColor: string | null;
+    /** Default body cell background */
+    bodyFillColor: string | null;
+    /** Alternating fill pattern (rows or columns) */
+    alternatingFills: {
+        enabled: boolean;
+        mode: AlternatingMode;
+        firstColor: string;
+        secondColor: string;
+        /** Skip first N body rows/columns from alternation */
+        skipFirst: number;
+        /** Skip last N body rows/columns from alternation */
+        skipLast: number;
+    };
+    /** Outer table border color */
+    outerStrokeColor: string;
+    /** Outer table border width */
+    outerStrokeWidth: number;
+    /** Inner horizontal row divider color */
+    innerRowStrokeColor: string;
+    /** Inner horizontal row divider width */
+    innerRowStrokeWidth: number;
+    /** Inner vertical column divider color */
+    innerColumnStrokeColor: string;
+    /** Inner vertical column divider width */
+    innerColumnStrokeWidth: number;
+    /** Legacy: inner stroke color (for backward compatibility) */
+    innerStrokeColor: string;
+    /** Legacy: inner stroke width (for backward compatibility) */
+    innerStrokeWidth: number;
+    /** Space before table (in parent text flow) */
+    spaceBefore: number;
+    /** Space after table (in parent text flow) */
+    spaceAfter: number;
+}
+
+export const DEFAULT_CELL_STYLE: CellStyle = {
+    paddingTop: 4,
+    paddingRight: 6,
+    paddingBottom: 4,
+    paddingLeft: 6,
+    fillColor: null,
+    strokeColor: '#cccccc',
+    strokeWidth: 0.5,
+    strokeProxy: null,
+    verticalAlign: 'top',
+    firstBaselineOffset: 'ascent',
+    firstBaselineMin: 0,
+    contentType: 'text',
+    rotation: 0,
+    clipContent: true,
+};
+
+export const DEFAULT_TABLE_STYLE: TableStyle = {
+    headerRows: 0,
+    footerRows: 0,
+    headerFillColor: null,
+    footerFillColor: null,
+    bodyFillColor: null,
+    alternatingFills: {
+        enabled: false,
+        mode: 'rows',
+        firstColor: '#ffffff',
+        secondColor: '#f5f5f5',
+        skipFirst: 0,
+        skipLast: 0,
+    },
+    outerStrokeColor: '#333333',
+    outerStrokeWidth: 1.5,
+    innerRowStrokeColor: '#cccccc',
+    innerRowStrokeWidth: 0.5,
+    innerColumnStrokeColor: '#cccccc',
+    innerColumnStrokeWidth: 0.5,
+    innerStrokeColor: '#cccccc',
+    innerStrokeWidth: 0.5,
+    spaceBefore: 0,
+    spaceAfter: 0,
+};
+
+// ── Inline Objects ──
+
+export interface InlineObject {
+    id: string;
+    type: 'table' | 'image' | 'custom';
+    /** Returns the current physical dimensions of the object */
+    getMetrics(): { width: number; height: number; ascent: number; descent: number };
+    /** Optional render method if the object draws itself on the canvas */
+    render?(ctx: CanvasRenderingContext2D, x: number, y: number): void;
+}
+
 // ── Text Shaping ──
 
 /** A single shaped glyph returned from HarfBuzz */
@@ -18,6 +171,10 @@ export interface ShapedGlyph {
     xOffset: number;
     /** Vertical offset from baseline cursor */
     yOffset: number;
+    /** True if this glyph represents an inline object */
+    isInlineObject?: boolean;
+    /** The actual inline object reference (if applicable) */
+    inlineObject?: InlineObject;
 }
 
 /** A contiguous run of shaped glyphs sharing identical style */
@@ -75,6 +232,8 @@ export interface BoxElement {
     microStretch: number;
     /** Micro-shrinkability for hz-program (0 = rigid) */
     microShrink: number;
+    /** Whether this box represents an inline object */
+    isInlineObject?: boolean;
 }
 
 export interface GlueElement {
@@ -136,6 +295,14 @@ export interface ComposedLine {
     alignment: TextAlignment;
     /** Whether optical margin alignment is enabled for this line's paragraph */
     opticalMargins?: boolean;
+    /** Effective left indent for this specific line (leftIndent + firstLineIndent for line 0) */
+    leftIndent?: number;
+    /** Right indent for this line */
+    rightIndent?: number;
+    /** Space before this line's paragraph (only set on first line of paragraph) */
+    spaceBefore?: number;
+    /** Space after this line's paragraph (only set on last line of paragraph) */
+    spaceAfter?: number;
 }
 
 // ── Layout Results ──
@@ -155,6 +322,16 @@ export interface PositionedGlyph {
     scale: number;
     /** Actual pixel advance width of this glyph (for cursor positioning) */
     advance: number;
+    /** Underline decoration */
+    underline?: boolean;
+    /** Strikethrough decoration */
+    strikethrough?: boolean;
+    /** Indicates if this positioned element is actually an inline object */
+    isInlineObject?: boolean;
+    /** Reference to the actual inline object */
+    inlineObject?: InlineObject;
+    /** The Story this glyph belongs to (used for hit testing within nested elements) */
+    story?: any; // any to avoid circular dependency in types.ts
 }
 
 export interface ColumnLayout {
@@ -204,8 +381,12 @@ export interface ParagraphStyle {
     spaceBefore: number;
     /** Space after paragraph in pt */
     spaceAfter: number;
-    /** First line indent in pt */
+    /** First line indent in pt (can be negative for hanging indent) */
     firstLineIndent: number;
+    /** Left indent in pt — applies to all lines */
+    leftIndent: number;
+    /** Right indent in pt — applies to all lines */
+    rightIndent: number;
     /** Which composer to use */
     composer: ComposerType;
     /** Enable hyphenation */
@@ -235,8 +416,14 @@ export interface CharacterStyle {
     color: string;
     /** Tracking / letter-spacing in em units */
     tracking: number;
-    /** Leading (line height) overrider as multiplier of font size */
+    /** Leading (line height) override as multiplier of font size */
     leading?: number;
+    /** Baseline shift in points — positive shifts up, negative shifts down */
+    baselineShift?: number;
+    /** Underline decoration */
+    underline?: boolean;
+    /** Strikethrough decoration */
+    strikethrough?: boolean;
     /** OpenType features: e.g., { liga: true, kern: true } */
     openTypeFeatures: Record<string, boolean>;
 }
@@ -247,6 +434,8 @@ export const DEFAULT_PARAGRAPH_STYLE: ParagraphStyle = {
     spaceBefore: 0,
     spaceAfter: 8,
     firstLineIndent: 0,
+    leftIndent: 0,
+    rightIndent: 0,
     composer: 'paragraph',
     hyphenation: false,
     maxConsecutiveHyphens: 3,
@@ -329,3 +518,93 @@ export const DEFAULT_ENGINE_CONFIG: EngineConfig = {
     paperWidth: 1200,
     paperHeight: 900,
 };
+
+// ── Table Cell Merge/Split ──
+
+/** Represents a merged cell span */
+export interface CellSpan {
+    /** Starting row of the merged region */
+    startRow: number;
+    /** Starting column of the merged region */
+    startCol: number;
+    /** Number of rows in the span */
+    rowSpan: number;
+    /** Number of columns in the span */
+    colSpan: number;
+}
+
+/** Graphic cell content for image/SVG placeholders */
+export interface GraphicCellContent {
+    /** Type of graphic */
+    type: 'image' | 'svg' | 'placeholder';
+    /** Source URL or data URI for the graphic */
+    src?: string;
+    /** SVG content (for inline SVG) */
+    svgContent?: string;
+    /** Fit mode: how the graphic fits within the cell */
+    fitMode: 'fill' | 'fit' | 'center' | 'tile';
+    /** Background color for placeholder or padding */
+    backgroundColor?: string;
+    /** Alt text for accessibility */
+    altText?: string;
+}
+
+// ── Saved Styles Management ──
+
+/** A saved cell style that can be applied to cells */
+export interface SavedCellStyle {
+    id: string;
+    name: string;
+    style: Partial<CellStyle>;
+    /** Optional based-on reference for style cascading */
+    basedOn?: string;
+}
+
+/** A saved table style that can be applied to tables */
+export interface SavedTableStyle {
+    id: string;
+    name: string;
+    style: Partial<TableStyle>;
+    /** Cell style to apply to header rows */
+    headerCellStyleId?: string;
+    /** Cell style to apply to footer rows */
+    footerCellStyleId?: string;
+    /** Cell style to apply to body cells */
+    bodyCellStyleId?: string;
+    /** Cell style to apply to left column */
+    leftColumnCellStyleId?: string;
+    /** Cell style to apply to right column */
+    rightColumnCellStyleId?: string;
+}
+
+/** Selection state for table cells */
+export interface TableSelection {
+    /** Currently selected cells as [row, col] pairs */
+    cells: Array<[number, number]>;
+    /** Active cell (for keyboard navigation) */
+    activeCell: [number, number] | null;
+    /** Whether we're in text editing mode within a cell */
+    isEditing: boolean;
+    /** Text selection within the active cell (if editing) */
+    textSelection?: { start: number; end: number };
+}
+
+/** Keyboard navigation direction */
+export type TableNavigationDirection = 'up' | 'down' | 'left' | 'right' | 'tab' | 'shiftTab';
+
+/** Import/export format for tables */
+export type TableExportFormat = 'csv' | 'json' | 'html';
+
+/** Table data structure for import/export */
+export interface TableData {
+    rows: number;
+    cols: number;
+    cells: Array<Array<{
+        text: string;
+        style?: Partial<CellStyle>;
+    }>>;
+    columnWidths?: number[];
+    rowHeights?: number[];
+    tableStyle?: Partial<TableStyle>;
+    mergedCells?: CellSpan[];
+}

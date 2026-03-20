@@ -28,6 +28,16 @@ const DEFAULT_CONFIG: WebGLRenderConfig = {
 };
 
 export class WebGLRenderer implements IGPURenderer {
+    /** Returns true if WebGL 2 is available in this browser/environment. */
+    static isSupported(): boolean {
+        try {
+            const c = document.createElement('canvas');
+            return !!c.getContext('webgl2');
+        } catch {
+            return false;
+        }
+    }
+
     private _canvas: HTMLCanvasElement;
     private _gl: WebGL2RenderingContext;
     private _config: WebGLRenderConfig;
@@ -44,7 +54,15 @@ export class WebGLRenderer implements IGPURenderer {
 
 
     private _capacity: number = 0;
-    private _transformMatrix: Float32Array = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]); // 3x3 identity
+    private _transformMatrix: Float32Array = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+
+    private _atlasMap = new Map<string, any>();
+
+    // Bold variant atlas (for fontWeight >= 700)
+    private _boldAtlasTexture: WebGLTexture | null = null;
+    private _boldAtlasMap = new Map<string, any>();
+    private _boldAtlasW = 0;
+    private _boldAtlasH = 0;
 
     constructor(canvas: HTMLCanvasElement, config: Partial<WebGLRenderConfig> = {}) {
         this._canvas = canvas;
@@ -81,6 +99,12 @@ export class WebGLRenderer implements IGPURenderer {
     /** Expose the offscreen canvas so the 2D renderer can composite it */
     getCanvas(): HTMLCanvasElement {
         return this._canvas;
+    }
+
+    /** Update the logical paper dimensions (e.g. when loading a new document). */
+    setPaperSize(width: number, height: number): void {
+        this._config.paperWidth = width;
+        this._config.paperHeight = height;
     }
 
     private _initShaders() {
@@ -182,15 +206,11 @@ export class WebGLRenderer implements IGPURenderer {
         gl.bindVertexArray(null);
     }
 
-    /** Set or update the MSDF atlas texture */
-    setAtlas(atlas: MSDFAtlas) {
+    /** Upload raw MSDF ImageData into an existing WebGL texture */
+    private _uploadAtlasTexture(tex: WebGLTexture, atlas: MSDFAtlas): void {
         const gl = this._gl;
-        if (!this._atlasTexture) {
-            this._atlasTexture = gl.createTexture();
-        }
-
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-        gl.bindTexture(gl.TEXTURE_2D, this._atlasTexture);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
 
 
 
@@ -241,6 +261,34 @@ export class WebGLRenderer implements IGPURenderer {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     }
 
+    /** Set or update the regular MSDF atlas texture */
+    setAtlas(atlas: MSDFAtlas) {
+        const gl = this._gl;
+        if (!this._atlasTexture) {
+            this._atlasTexture = gl.createTexture()!;
+        }
+        this._uploadAtlasTexture(this._atlasTexture, atlas);
+        this._atlasMap.clear();
+        for (const ag of atlas.glyphs) {
+            this._atlasMap.set(ag.char, ag);
+        }
+    }
+
+    /** Set or update the Bold variant MSDF atlas (used for fontWeight >= 700) */
+    setBoldAtlas(atlas: MSDFAtlas) {
+        const gl = this._gl;
+        if (!this._boldAtlasTexture) {
+            this._boldAtlasTexture = gl.createTexture()!;
+        }
+        this._uploadAtlasTexture(this._boldAtlasTexture, atlas);
+        this._boldAtlasMap.clear();
+        for (const ag of atlas.glyphs) {
+            this._boldAtlasMap.set(ag.char, ag);
+        }
+        this._boldAtlasW = atlas.textureSize[0];
+        this._boldAtlasH = atlas.textureSize[1];
+    }
+
     /** Set the camera transformation (pan/zoom) */
     setTransform(scale: number, tx: number, ty: number) {
         this._transformMatrix[0] = scale; this._transformMatrix[1] = 0; this._transformMatrix[2] = 0;
@@ -279,86 +327,59 @@ export class WebGLRenderer implements IGPURenderer {
 
         if (!atlas || layout.glyphs.length === 0) return;
 
-        // 1. Pack instance data
-        // Each instance needs 11 floats (pos 2f, size 2f, uvTop 2f, uvBot 2f, color 3f)
-        const instanceData = new Float32Array(layout.glyphs.length * 11);
-        let validGlyphs = 0;
+        // Build separate instance data for regular and bold glyphs.
+        // Bold glyphs render with the bold atlas (if set); regular with the regular atlas.
+        // Each instance: 11 floats (pos 2f, size 2f, uvTopLeft 2f, uvBotRight 2f, color 3f)
+        const n = layout.glyphs.length;
+        const regularData = new Float32Array(n * 11);
+        const boldData = new Float32Array(n * 11);
+        let regularCount = 0;
+        let boldCount = 0;
+
         const atlasW = atlas.textureSize[0];
         const atlasH = atlas.textureSize[1];
+        const boldAtlasW = this._boldAtlasW || atlasW;
+        const boldAtlasH = this._boldAtlasH || atlasH;
+        const ATLAS_FONT_SIZE = 42.0;
 
-        // We need to scale the MSDF glyph bounds to the logical pixel size
-        // MSDF atlas sizes are based on internal font units normalized.
-        // `@zappar/msdf-generator` returns glyph info with `bounds` and `atlasPosition/Size`.
-
-
-
-        for (let i = 0; i < layout.glyphs.length; i++) {
+        for (let i = 0; i < n; i++) {
             const g = layout.glyphs[i]!;
             const chr = g.char ?? '';
+            const isBold = this._boldAtlasTexture !== null &&
+                (g.fontWeight === 700 || g.fontWeight === '700');
 
-            // Find glyph in atlas metadata
-            const atlasGlyph = atlas.glyphs.find(ag => ag.char === chr);
+            const aMap = isBold ? this._boldAtlasMap : this._atlasMap;
+            const aw = isBold ? boldAtlasW : atlasW;
+            const ah = isBold ? boldAtlasH : atlasH;
+
+            // Fall back to regular atlas if char missing from bold atlas
+            const atlasGlyph = aMap.get(chr) ?? (isBold ? this._atlasMap.get(chr) : undefined);
             if (!atlasGlyph) continue;
 
-            // Geometry logic: MSDF glyphs have specific scaled bounds
-            // The bounds are usually normalized relative to the em-square.
-            // We'll calculate the quad size and position offset based on atlas bounds.
-
-            // The SDF edge adds some padding (fieldRange).
-            // We need to expand the rendering quad to account for the padding.
-            // UVs
-            const uvX = atlasGlyph.atlasPosition[0] / atlasW;
-            const uvY = atlasGlyph.atlasPosition[1] / atlasH;
-            const uvW = atlasGlyph.atlasSize[0] / atlasW;
-            const uvH = atlasGlyph.atlasSize[1] / atlasH;
-
-            // Wait, we need the exact physical dimensions for the quad.
-            // For now, let's map the atlas bounds to the target font size physically.
-            // We know the font size from `g.style.fontSize`.
-
-            // Layout offsets based on `atlasGlyph.bounds` (distance from baseline)
-            // Left, bottom, right, top are typically normalized (0 to 1).
-            // MSDF Generator defines bounds relative to em size.
-
-            // The atlas was generated with fontSize: 42. So bounds and offsets are in pixels at size 42.
-            const ATLAS_FONT_SIZE = 42.0;
             const emScale = g.fontSize / ATLAS_FONT_SIZE;
 
+            const uvX = atlasGlyph.atlasPosition[0] / aw;
+            const uvY = atlasGlyph.atlasPosition[1] / ah;
+            const uvW = atlasGlyph.atlasSize[0] / aw;
+            const uvH = atlasGlyph.atlasSize[1] / ah;
+
             const w = (atlasGlyph.bounds.right - atlasGlyph.bounds.left) * emScale;
-            // The bounds top/bottom might have the origin at the baseline
-            // top is positive, bottom is negative (or zero).
             const h = (atlasGlyph.bounds.top - atlasGlyph.bounds.bottom) * emScale;
+            const physX = g.x + atlasGlyph.xoffset * emScale;
+            const physY = g.y - atlasGlyph.bounds.top * emScale;
 
-            // X offset from the cursor
-            const physX = g.x + (atlasGlyph.xoffset * emScale);
-            // Y offset from the baseline (baseline is Y+ down, but bounds are Y+ up)
-            const physY = g.y - (atlasGlyph.bounds.top * emScale);
-
-            // Calculate padded bounds (the texture contains the field range)
-            // The atlas bounds DO NOT include the SDF padding, but the atlasSize DOES.
-            // Wait, atlasSize = width + 2*fieldRange. We must scale the rendering quad identically.
-
-            // Ratio of padded size to unpadded size
             const paddedW = atlasGlyph.atlasSize[0];
-            const unpaddedW = Math.max((atlasGlyph.bounds.right - atlasGlyph.bounds.left), 0.0001); // Avoid div 0 if char is empty e.g. space
+            const unpaddedW = Math.max(atlasGlyph.bounds.right - atlasGlyph.bounds.left, 0.0001);
             const xPaddingRatio = paddedW / unpaddedW;
-
             const paddedH = atlasGlyph.atlasSize[1];
-            const unpaddedH = Math.max((atlasGlyph.bounds.top - atlasGlyph.bounds.bottom), 0.0001);
+            const unpaddedH = Math.max(atlasGlyph.bounds.top - atlasGlyph.bounds.bottom, 0.0001);
             const yPaddingRatio = paddedH / unpaddedH;
 
-            // Scale physWidth by padding ratio
             const finalW = w * xPaddingRatio;
             const finalH = h * yPaddingRatio;
+            const finalX = physX - (finalW - w) / 2;
+            const finalY = physY - (finalH - h) / 2;
 
-            // Offset the X and Y backwards by the padding amount to keep centered
-            const xPadPhysical = (finalW - w) / 2;
-            const yPadPhysical = (finalH - h) / 2;
-
-            const finalX = physX - xPadPhysical;
-            const finalY = physY - yPadPhysical;
-
-            // Parse glyph color (hex string like '#e74c3c' to RGB 0-1)
             const colorStr = g.color || '#000000';
             let cr = 0, cg = 0, cb = 0;
             if (colorStr.startsWith('#') && colorStr.length >= 7) {
@@ -367,63 +388,57 @@ export class WebGLRenderer implements IGPURenderer {
                 cb = parseInt(colorStr.slice(5, 7), 16) / 255;
             }
 
-            // Pack
-            const idx = validGlyphs * 11;
-            instanceData[idx + 0] = finalX;
-            instanceData[idx + 1] = finalY;
-            instanceData[idx + 2] = finalW;
-            instanceData[idx + 3] = finalH;
+            const dest = isBold ? boldData : regularData;
+            const idx = (isBold ? boldCount : regularCount) * 11;
+            dest[idx + 0] = finalX;
+            dest[idx + 1] = finalY;
+            dest[idx + 2] = finalW;
+            dest[idx + 3] = finalH;
+            dest[idx + 4] = uvX;
+            dest[idx + 5] = uvY;
+            dest[idx + 6] = uvX + uvW;
+            dest[idx + 7] = uvY + uvH;
+            dest[idx + 8] = cr;
+            dest[idx + 9] = cg;
+            dest[idx + 10] = cb;
 
-            instanceData[idx + 4] = uvX;
-            instanceData[idx + 5] = uvY;
-            instanceData[idx + 6] = uvX + uvW;
-            instanceData[idx + 7] = uvY + uvH;
-
-            instanceData[idx + 8] = cr;
-            instanceData[idx + 9] = cg;
-            instanceData[idx + 10] = cb;
-
-
-
-            validGlyphs++;
+            if (isBold) boldCount++; else regularCount++;
         }
 
+        if (regularCount + boldCount === 0) return;
 
-
-        if (validGlyphs === 0) return;
-
-        // Upload instance data
-        gl.bindBuffer(gl.ARRAY_BUFFER, this._instanceBuffer);
-
-        // Ensure the buffer is large enough
-        if (validGlyphs > this._capacity) {
-            // Reallocate buffer with some extra padding to avoid frequent reallocations
-            const newCapacity = validGlyphs * 2;
-            const newBuffer = new Float32Array(newCapacity * 11);
-            newBuffer.set(instanceData.subarray(0, validGlyphs * 11));
-
-            gl.bufferData(gl.ARRAY_BUFFER, newBuffer, gl.DYNAMIC_DRAW);
-            this._capacity = newCapacity;
-        } else {
-            // Update existing buffer
-            gl.bufferSubData(gl.ARRAY_BUFFER, 0, instanceData.subarray(0, validGlyphs * 11));
-        }
-
-        // Draw instances
+        // Common render state
         gl.enable(gl.BLEND);
-        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // Premultiplied alpha blending
-
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
         gl.useProgram(this._program);
         gl.bindVertexArray(this._vao);
-
         gl.uniform2f(this._uResLoc, this._canvas.width / this._config.dpiScale, this._canvas.height / this._config.dpiScale);
         gl.uniformMatrix3fv(this._uTransformLoc, false, this._transformMatrix);
 
+        // Upload a batch to the shared instance buffer and issue a draw call
+        const drawBatch = (data: Float32Array, count: number, texture: WebGLTexture) => {
+            gl.bindBuffer(gl.ARRAY_BUFFER, this._instanceBuffer);
+            if (count > this._capacity) {
+                const newCapacity = count * 2;
+                const buf = new Float32Array(newCapacity * 11);
+                buf.set(data.subarray(0, count * 11));
+                gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
+                this._capacity = newCapacity;
+            } else {
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, data.subarray(0, count * 11));
+            }
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+        };
 
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, this._atlasTexture);
-
-        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, validGlyphs);
+        if (regularCount > 0 && this._atlasTexture) {
+            drawBatch(regularData, regularCount, this._atlasTexture);
+        }
+        if (boldCount > 0) {
+            const boldTex = this._boldAtlasTexture ?? this._atlasTexture;
+            if (boldTex) drawBatch(boldData, boldCount, boldTex);
+        }
 
         gl.bindVertexArray(null);
     }
@@ -435,5 +450,6 @@ export class WebGLRenderer implements IGPURenderer {
         if (this._vao) gl.deleteVertexArray(this._vao);
         if (this._instanceBuffer) gl.deleteBuffer(this._instanceBuffer);
         if (this._atlasTexture) gl.deleteTexture(this._atlasTexture);
+        if (this._boldAtlasTexture) gl.deleteTexture(this._boldAtlasTexture);
     }
 }

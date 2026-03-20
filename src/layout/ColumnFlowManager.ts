@@ -15,7 +15,8 @@ import type {
 } from '../types';
 import { FrameManager } from '../core/TextFrame';
 import { FontManager } from '../shaping/FontManager';
-import { computeLineScale, DEFAULT_HZ_CONFIG } from './GlyphScaler';
+// computeLineScale (Hz-program) is not applied during glyph placement —
+// KP glue adjustment is sufficient to satisfy the lineWidth invariant.
 import { getLeadingIndent, getTrailingIndent } from './OpticalMargins';
 import { ScanlineEngine } from '../geometry/ScanlineEngine';
 import type { WrapPolygon } from '../geometry/ScanlineEngine';
@@ -70,8 +71,6 @@ function alignmentOffset(
  */
 function pickBestSlot(
     intervals: { x: number; width: number }[],
-    columnX: number,
-    columnWidth: number,
 ): { x: number; width: number } | null {
     // Ignore tiny slivers that can't realistically fit text
     const MIN_SLOT_WIDTH = 30;
@@ -139,7 +138,15 @@ export class ColumnFlowManager {
                 let currentY = column.y;
 
                 while (lineIdx < lines.length) {
-                    const lineHeight = lines[lineIdx]!.lineHeight;
+                    const line = lines[lineIdx]!;
+                    const lineHeight = line.lineHeight;
+
+                    // Add spaceBefore for first line of a paragraph
+                    // (skip for the very first line in the column to avoid top gap)
+                    const sb = line.spaceBefore ?? 0;
+                    if (sb > 0 && currentY > column.y) {
+                        currentY += sb;
+                    }
 
                     if (currentY + lineHeight > column.y + column.height) break;
 
@@ -150,26 +157,27 @@ export class ColumnFlowManager {
 
                     // Pick the best slot. If null, the band is occluded (or splitting center polygon).
                     // In that case, we advance Y and check the next band.
-                    const slot = pickBestSlot(intervals, column.x, column.width);
+                    const slot = pickBestSlot(intervals);
                     if (!slot) {
                         currentY += lineHeight;
                         continue;
                     }
-
-                    const line = lines[lineIdx]!;
                     const isLastLine = lineIdx === lines.length - 1 ||
                         lines[lineIdx + 1]?.alignment !== line.alignment;
 
+                    const lineLeftIndent = line.leftIndent ?? 0;
+                    const lineRightIndent = line.rightIndent ?? 0;
+                    const textAreaWidth = slot.width - lineLeftIndent - lineRightIndent;
                     const positionedLine: ComposedLine = {
                         ...line,
                         baselineY: currentY + lineHeight * 0.8,
-                        startX: slot.x + alignmentOffset(
+                        startX: slot.x + lineLeftIndent + alignmentOffset(
                             naturalWidth(line.elements),
-                            slot.width,
+                            textAreaWidth,
                             line.alignment,
                             isLastLine,
                         ),
-                        width: slot.width,
+                        width: textAreaWidth,
                     };
 
                     // Optical margin alignment
@@ -208,6 +216,12 @@ export class ColumnFlowManager {
                     column.lines.push(positionedLine);
                     lineIdx++;
                     currentY += lineHeight;
+
+                    // Add spaceAfter for last line of a paragraph
+                    const sa = line.spaceAfter ?? 0;
+                    if (sa > 0) {
+                        currentY += sa;
+                    }
                 }
             }
 
@@ -241,7 +255,7 @@ export class ColumnFlowManager {
         frameManager: FrameManager,
         startFrameId: string,
         approxLineHeight: number,
-        maxLinesToSimulate: number = 200,
+        maxLinesToSimulate: number = 500,
     ): number[] {
         const widths: number[] = [];
 
@@ -261,6 +275,13 @@ export class ColumnFlowManager {
                 // 1. Consume previous lines in this column
                 while (lineIdx < previousLines.length) {
                     const line = previousLines[lineIdx]!;
+
+                    // spaceBefore (skip at column top)
+                    const sb = line.spaceBefore ?? 0;
+                    if (sb > 0 && currentY > col.y) {
+                        currentY += sb;
+                    }
+
                     if (currentY + line.lineHeight > col.y + col.height) {
                         break; // Move to next column
                     }
@@ -269,7 +290,7 @@ export class ColumnFlowManager {
                         const intervals = this._scanlineEngine.getRectIntervals(
                             col.x, col.width, this._wrapPolygons, currentY, line.lineHeight,
                         );
-                        const slot = pickBestSlot(intervals, col.x, col.width);
+                        const slot = pickBestSlot(intervals);
                         if (!slot) {
                             currentY += line.lineHeight;
                             continue; // Band occluded, advance Y but don't consume a line
@@ -277,6 +298,9 @@ export class ColumnFlowManager {
                     }
 
                     currentY += line.lineHeight;
+                    // spaceAfter
+                    const sa = line.spaceAfter ?? 0;
+                    if (sa > 0) currentY += sa;
                     lineIdx++;
                 }
 
@@ -297,7 +321,7 @@ export class ColumnFlowManager {
                         const intervals = this._scanlineEngine.getRectIntervals(
                             col.x, col.width, this._wrapPolygons, currentY, approxLineHeight,
                         );
-                        const slot = pickBestSlot(intervals, col.x, col.width);
+                        const slot = pickBestSlot(intervals);
                         if (slot) {
                             widths.push(slot.width);
                             pLineIdx++;
@@ -342,10 +366,14 @@ export class ColumnFlowManager {
         elements: KnuthPlassElement[],
         breaks: LineBreak[],
         paraStyle: ParagraphStyle,
+        /** Font size (pt) used for empty lines that contain no box elements */
+        emptyLineFontSize = 14,
     ): ComposedLine[] {
         const lines: ComposedLine[] = [];
+        const leftInd = paraStyle.leftIndent ?? 0;
+        const rightInd = paraStyle.rightIndent ?? 0;
+        const fli = paraStyle.firstLineIndent ?? 0;
         let startIdx = 0;
-        const defaultFontSize = 14;
 
         for (const brk of breaks) {
             const lineElements = extractLineElements(elements, startIdx, brk.breakIndex);
@@ -359,6 +387,15 @@ export class ColumnFlowManager {
             let maxLineHeight = 0;
             for (const el of lineElements) {
                 if (el.type === 'box') {
+                    // Inline objects (tables, images) define their own height
+                    if (el.isInlineObject) {
+                        const objGlyph = el.glyphs[0]?.glyph;
+                        if (objGlyph?.inlineObject) {
+                            const h = objGlyph.inlineObject.getMetrics().height;
+                            if (h > maxLineHeight) maxLineHeight = h;
+                            continue;
+                        }
+                    }
                     const charLeading = el.style.leading ?? paraStyle.leading;
                     const h = el.style.fontSize * charLeading;
                     if (h > maxLineHeight) maxLineHeight = h;
@@ -366,7 +403,7 @@ export class ColumnFlowManager {
             }
 
             let lineHeight = maxLineHeight;
-            if (lineHeight === 0) lineHeight = defaultFontSize * paraStyle.leading;
+            if (lineHeight === 0) lineHeight = emptyLineFontSize * paraStyle.leading;
 
             let lineStartOffset = 0;
             let lineEndOffset = 0;
@@ -385,6 +422,8 @@ export class ColumnFlowManager {
                 }
             }
 
+            const lineIndex = lines.length;
+            const effectiveLeftIndent = leftInd + (lineIndex === 0 ? fli : 0);
             lines.push({
                 elements: lineElements,
                 adjustmentRatio: brk.adjustmentRatio,
@@ -394,10 +433,18 @@ export class ColumnFlowManager {
                 endOffset: lineEndOffset,
                 alignment: paraStyle.alignment,
                 opticalMargins: paraStyle.opticalMargins,
+                leftIndent: effectiveLeftIndent,
+                rightIndent: rightInd,
             });
 
             startIdx = brk.breakIndex + 1;
             while (startIdx < elements.length && elements[startIdx]?.type === 'glue') startIdx++;
+        }
+
+        // Tag first line with spaceBefore, last line with spaceAfter
+        if (lines.length > 0) {
+            lines[0]!.spaceBefore = paraStyle.spaceBefore ?? 0;
+            lines[lines.length - 1]!.spaceAfter = paraStyle.spaceAfter ?? 0;
         }
 
         return lines;
@@ -405,26 +452,42 @@ export class ColumnFlowManager {
 
     private _positionGlyphs(
         line: ComposedLine,
-        _columnWidth: number,
+        slotWidth: number,
         alignment: TextAlignment,
         isLastLine: boolean,
     ): PositionedGlyph[] {
         const positioned: PositionedGlyph[] = [];
-        const { elements, adjustmentRatio, baselineY, startX } = line;
+        const { elements, baselineY, startX } = line;
 
         const shouldJustify =
             (alignment === 'justify' && !isLastLine) ||
             alignment === 'forceJustify';
 
-        const naturalBoxWidth = elements
-            .filter(el => el.type === 'box')
-            .reduce((sum, el) => sum + (el.type === 'box' ? el.width : 0), 0);
+        const lineScale = 1.0;
 
-        const hzLineScale = computeLineScale(naturalBoxWidth, _columnWidth, adjustmentRatio, DEFAULT_HZ_CONFIG);
-
-        // If the layout engine squeezed this line (adjustmentRatio < 0) to fit a narrow bounds,
-        // we MUST apply the shrink scaling even if we are left-aligned, otherwise it visually overflows.
-        const lineScale = (shouldJustify || adjustmentRatio < 0) ? hzLineScale : 1.0;
+        // Recompute the adjustment ratio against the ACTUAL slot width.
+        // KP's stored ratio was computed against a simulated width that may diverge
+        // from the real slot (e.g. when a paragraph straddles a frame boundary and
+        // the simulation's approxLineHeight drifts from the actual lineHeight).
+        // Re-deriving here guarantees sum(boxes) + sum(adjusted_glue) == slotWidth
+        // for justified text, preventing glyphs from overflowing the right edge.
+        let adjustmentRatio = line.adjustmentRatio;
+        if (shouldJustify || line.adjustmentRatio < 0) {
+            let natW = 0;
+            let totalStretch = 0;
+            let totalShrink = 0;
+            for (const el of elements) {
+                if (el.type === 'box')  { natW += el.width; }
+                if (el.type === 'glue') { natW += el.width; totalStretch += el.stretch; totalShrink += el.shrink; }
+            }
+            if (natW < slotWidth && totalStretch > 0) {
+                adjustmentRatio = (slotWidth - natW) / totalStretch;
+            } else if (natW > slotWidth && totalShrink > 0) {
+                adjustmentRatio = (slotWidth - natW) / totalShrink;
+            } else {
+                adjustmentRatio = 0;
+            }
+        }
 
         let x = startX;
 
@@ -433,16 +496,27 @@ export class ColumnFlowManager {
                 let glyphX = x;
                 for (const item of el.glyphs) {
                     const glyph = item.glyph;
-                    const advance = this._fontManager.fontUnitsToPixels(glyph.xAdvance, el.style.fontSize, el.style.fontFamily);
-                    const xOff = this._fontManager.fontUnitsToPixels(glyph.xOffset, el.style.fontSize, el.style.fontFamily);
-                    const yOff = this._fontManager.fontUnitsToPixels(glyph.yOffset, el.style.fontSize, el.style.fontFamily);
+                    const isObj = glyph.isInlineObject ?? false;
+
+                    const advance = isObj
+                        ? glyph.xAdvance
+                        : this._fontManager.fontUnitsToPixels(glyph.xAdvance, el.style.fontSize, el.style.fontFamily);
+
+                    const xOff = isObj
+                        ? glyph.xOffset
+                        : this._fontManager.fontUnitsToPixels(glyph.xOffset, el.style.fontSize, el.style.fontFamily);
+
+                    const yOff = isObj
+                        ? glyph.yOffset
+                        : this._fontManager.fontUnitsToPixels(glyph.yOffset, el.style.fontSize, el.style.fontFamily);
 
                     positioned.push({
                         glyphId: glyph.glyphId,
                         char: item.char,
                         charOffset: item.charOffset,
                         x: glyphX + xOff,
-                        y: baselineY - yOff,
+                        // baselineShift is in points (positive = up); subtract to raise glyph
+                        y: baselineY - yOff - (el.style.baselineShift ?? 0),
                         fontSize: el.style.fontSize,
                         fontFamily: el.style.fontFamily,
                         fontWeight: el.style.fontWeight,
@@ -450,17 +524,26 @@ export class ColumnFlowManager {
                         color: el.style.color,
                         scale: lineScale,
                         advance: advance * lineScale,
+                        underline: el.style.underline,
+                        strikethrough: el.style.strikethrough,
+                        isInlineObject: isObj,
+                        inlineObject: isObj ? glyph.inlineObject : undefined,
                     });
 
                     glyphX += advance * lineScale;
                 }
                 x = glyphX;
             } else if (el.type === 'glue') {
+                // Glue adjustment using the re-derived ratio:
+                //   shouldJustify && ratio≥0  → stretch glue to fill the slot
+                //   shouldJustify && ratio<0  → shrink glue (over-full justified line)
+                //   !shouldJustify && ratio<0 → shrink glue to prevent overflow
+                //   !shouldJustify && ratio≥0 → natural glue (unused space at right edge)
                 let adjustedWidth = el.width;
                 if (shouldJustify || adjustmentRatio < 0) {
                     adjustedWidth = adjustmentRatio >= 0
                         ? el.width + adjustmentRatio * el.stretch
-                        : el.width + (adjustmentRatio * el.shrink);
+                        : el.width + adjustmentRatio * el.shrink;
                 }
                 x += adjustedWidth;
             }

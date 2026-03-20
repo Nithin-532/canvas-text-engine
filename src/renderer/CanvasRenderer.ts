@@ -68,7 +68,8 @@ export class CanvasRenderer {
 
     updateConfig(partial: Partial<RenderConfig>): void {
         this._config = { ...this._config, ...partial };
-        this._setupCanvas();
+        // The display dimensions and backing buffer are dynamically updated by React
+        // and the `render()` method respectively. We shouldn't force-reset them here.
     }
 
     /**
@@ -78,29 +79,28 @@ export class CanvasRenderer {
         const { paperWidth, paperHeight, dpiScale } = this._config;
         this._canvas.width = paperWidth * dpiScale;
         this._canvas.height = paperHeight * dpiScale;
-        this._canvas.style.width = `${paperWidth}px`;
-        this._canvas.style.height = `${paperHeight}px`;
         this._ctx.setTransform(dpiScale, 0, 0, dpiScale, 0, 0);
     }
 
     /**
      * Render the complete layout result.
      */
-    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null, wrapObjects: WrapObject[] = [], webglCanvas?: HTMLCanvasElement, zoom: number = 1): void {
+    render(result: LayoutResult, frames: TextFrame[], selection: [number, number] | null = null, wrapObjects: WrapObject[] = [], webglCanvas?: HTMLCanvasElement, zoom: number = 1, activeStory?: import('../core/Story').Story): void {
         const ctx = this._ctx;
         const { paperWidth, paperHeight, paperColor } = this._config;
 
-        // Resize backing store for zoom so we get more pixels, not CSS upscaling
-        const targetW = Math.round(paperWidth * zoom);
-        const targetH = Math.round(paperHeight * zoom);
+        const dpr = window.devicePixelRatio || 1;
+        // Resize backing store for zoom+DPR so we get crisp pixels on retina displays
+        const targetW = Math.round(paperWidth * zoom * dpr);
+        const targetH = Math.round(paperHeight * zoom * dpr);
         if (this._canvas.width !== targetW || this._canvas.height !== targetH) {
             this._canvas.width = targetW;
             this._canvas.height = targetH;
         }
 
-        // Apply zoom transform — all drawing uses layout coordinates,
-        // but renders into the zoomed pixel buffer for crisp output
-        ctx.setTransform(zoom, 0, 0, zoom, 0, 0);
+        // Apply zoom+DPR transform — all drawing uses layout coordinates,
+        // but renders into the zoomed+DPR pixel buffer for crisp output
+        ctx.setTransform(zoom * dpr, 0, 0, zoom * dpr, 0, 0);
 
         // Clear canvas with paper background
         if (this._config.drawText || webglCanvas) {
@@ -112,11 +112,6 @@ export class CanvasRenderer {
 
         if (webglCanvas) {
             ctx.drawImage(webglCanvas, 0, 0, paperWidth, paperHeight);
-        }
-
-        // Draw selection first so it's behind text
-        if (selection) {
-            this._drawSelection(result, selection);
         }
 
         // Draw frame outlines
@@ -157,8 +152,36 @@ export class CanvasRenderer {
         }
         ctx.clip();
 
-        // Draw glyphs
+        // Draw selection inside clip so it doesn't bleed outside frame bounds
+        if (selection) {
+            const storyToUse = activeStory ?? (result.glyphs.length > 0 ? result.glyphs[0]!.story : undefined);
+            if (storyToUse) {
+                this._drawSelection(result, selection, storyToUse);
+            }
+        }
+
+        // Draw inline object backgrounds FIRST (before glyphs so text appears on top)
+        for (const g of result.glyphs) {
+            if (g.isInlineObject && g.inlineObject?.type === 'table') {
+                const table = g.inlineObject as import('../core/Table').Table;
+                const metrics = table.getMetrics();
+                // Render table backgrounds and fills only
+                table.renderBackground(ctx, g.x, g.y - metrics.ascent);
+            }
+        }
+
+        // Draw glyphs (including table cell text which is flattened into result.glyphs)
         this._renderGlyphs(result.glyphs);
+
+        // Draw inline object strokes/borders AFTER glyphs (on top of text)
+        for (const g of result.glyphs) {
+            if (g.isInlineObject && g.inlineObject?.type === 'table') {
+                const table = g.inlineObject as import('../core/Table').Table;
+                const metrics = table.getMetrics();
+                // Render table strokes and decorations
+                table.renderStrokes(ctx, g.x, g.y - metrics.ascent);
+            }
+        }
 
         ctx.restore(); // Restore clipping
 
@@ -225,6 +248,7 @@ export class CanvasRenderer {
             const [fontSpec, color] = key.split('|');
             ctx.fillStyle = color ?? '#000';
             ctx.textBaseline = 'alphabetic';
+            ctx.font = fontSpec!; // Set once per group — avoid per-glyph ctx.font cost
 
             for (const glyph of groupGlyphs) {
                 const hasScale = Math.abs(glyph.scale - 1.0) > 0.001;
@@ -234,21 +258,62 @@ export class CanvasRenderer {
                     ctx.save();
                     ctx.translate(glyph.x, 0);
                     ctx.scale(glyph.scale, 1.0);
-                    ctx.font = fontSpec!;
+                    ctx.font = fontSpec!; // Re-set after save (ctx state was pushed)
                     if (glyph.char) {
                         ctx.fillText(glyph.char, 0, glyph.y);
                     }
                     ctx.restore();
+                    ctx.font = fontSpec!; // Restore font after ctx.restore()
                 } else {
-                    ctx.font = fontSpec!;
                     if (glyph.char) {
                         ctx.fillText(glyph.char, glyph.x, glyph.y);
                     } else {
                         ctx.fillText(' ', glyph.x, glyph.y);
                     }
                 }
+
+                // Draw underline / strikethrough decorations
+                if ((glyph.underline || glyph.strikethrough) && glyph.advance > 0) {
+                    const glyphW = glyph.advance;
+                    ctx.save();
+                    ctx.strokeStyle = color ?? '#000';
+                    ctx.lineWidth = Math.max(0.5, glyph.fontSize * 0.06);
+                    ctx.beginPath();
+                    if (glyph.underline) {
+                        const uy = glyph.y + glyph.fontSize * 0.12;
+                        ctx.moveTo(glyph.x, uy);
+                        ctx.lineTo(glyph.x + glyphW, uy);
+                    }
+                    if (glyph.strikethrough) {
+                        const sy = glyph.y - glyph.fontSize * 0.3;
+                        ctx.moveTo(glyph.x, sy);
+                        ctx.lineTo(glyph.x + glyphW, sy);
+                    }
+                    ctx.stroke();
+                    ctx.restore();
+                }
             }
         }
+    }
+
+    /**
+     * Draw an array of IDML graphic lines (rules, dimension marks, etc.).
+     * Called from App after rendering the main layout.
+     */
+    drawGraphicLines(lines: Array<{ x1: number; y1: number; x2: number; y2: number; strokeColor: string; strokeWidth: number }>): void {
+        if (!lines.length) return;
+        const ctx = this._ctx;
+        ctx.save();
+        for (const line of lines) {
+            if (line.strokeWidth <= 0) continue;
+            ctx.strokeStyle = line.strokeColor;
+            ctx.lineWidth = line.strokeWidth;
+            ctx.beginPath();
+            ctx.moveTo(line.x1, line.y1);
+            ctx.lineTo(line.x2, line.y2);
+            ctx.stroke();
+        }
+        ctx.restore();
     }
 
     /**
@@ -309,7 +374,7 @@ export class CanvasRenderer {
         ctx.textAlign = 'start';
     }
 
-    private _drawSelection(result: LayoutResult, selection: [number, number]): void {
+    private _drawSelection(result: LayoutResult, selection: [number, number], activeStory: import('../core/Story').Story): void {
         const [start, end] = selection;
         const minOffset = Math.min(start, end);
         const maxOffset = Math.max(start, end);
@@ -317,10 +382,10 @@ export class CanvasRenderer {
 
         if (minOffset === maxOffset) {
             // Draw caret
-            let caretGlyph = result.glyphs.find(g => g.charOffset === minOffset);
+            let caretGlyph = result.glyphs.find(g => g.charOffset === minOffset && g.story === activeStory);
             let isAfter = false;
             if (!caretGlyph) {
-                caretGlyph = result.glyphs.find(g => g.charOffset === minOffset - 1);
+                caretGlyph = result.glyphs.find(g => g.charOffset === minOffset - 1 && g.story === activeStory);
                 isAfter = true;
             }
             if (caretGlyph) {
@@ -328,73 +393,82 @@ export class CanvasRenderer {
                 const x = isAfter ? caretGlyph.x + caretGlyph.advance : caretGlyph.x;
                 ctx.fillStyle = '#2563eb'; // blue-600
                 ctx.fillRect(x - 1, caretGlyph.y - caretGlyph.fontSize * 0.8, 2, caretGlyph.fontSize);
+            } else {
+                // Fallback: if activeStory has no glyphs (e.g. empty table cell),
+                // find the cell position and draw caret there
+                for (const g of result.glyphs) {
+                    if (!g.isInlineObject || !g.inlineObject || g.inlineObject.type !== 'table') continue;
+                    const table = g.inlineObject as import('../core/Table').Table;
+                    const metrics = table.getMetrics();
+                    const tableX = g.x;
+                    const tableY = g.y - metrics.ascent;
+
+                    let cellYPos = tableY;
+                    for (let r = 0; r < table.rows; r++) {
+                        const rowH = table.getRowHeight(r);
+                        let cellXPos = tableX;
+                        for (let c = 0; c < table.cols; c++) {
+                            const colW = table.getColumnWidth(c);
+                            // Use getAnchorCell to handle merged cells
+                            const cell = table.getAnchorCell(r, c);
+                            if (cell && cell.story === activeStory) {
+                                const s = cell.style;
+                                const caretX = cellXPos + s.paddingLeft;
+                                const caretY = cellYPos + s.paddingTop;
+                                ctx.fillStyle = '#2563eb';
+                                ctx.fillRect(caretX - 1, caretY, 2, 14);
+                                return; // Early exit — found the cell
+                            }
+                            cellXPos += colW;
+                        }
+                        cellYPos += rowH;
+                    }
+                }
             }
             return;
         }
 
         ctx.fillStyle = 'rgba(37, 99, 235, 0.2)'; // Selection color
 
-        for (const frame of result.frames) {
-            for (const column of frame.columns) {
-                for (const line of column.lines) {
-                    // Check if this line intersects the selection range
-                    if (minOffset <= line.endOffset && maxOffset >= line.startOffset) {
+        const glyphsInRange = result.glyphs.filter(g => g.story === activeStory && g.charOffset >= minOffset && g.charOffset < maxOffset);
 
-                        // Get all glyphs on this line that fall WITHIN the selection range
-                        const selectedGlyphsOnLine = result.glyphs.filter(g =>
-                            g.y === line.baselineY &&
-                            g.charOffset >= minOffset &&
-                            g.charOffset < maxOffset
-                        ).sort((a, b) => a.x - b.x);
+        // Group by rounded Y so sub-pixel differences don't split one visual line into two rects
+        const linesMap = new Map<number, typeof result.glyphs>();
+        for (const g of glyphsInRange) {
+            const ky = Math.round(g.y * 2) / 2; // 0.5pt buckets
+            let arr = linesMap.get(ky);
+            if (!arr) { arr = []; linesMap.set(ky, arr); }
+            arr.push(g);
+        }
 
-                        let startX = line.startX;
-                        let endX = line.startX; // Build width dynamically based on glyphs
-
-                        if (selectedGlyphsOnLine.length > 0) {
-                            // If it spans entire line, the endX defaults to the last printable glyph, not the whole invisible column block
-                            const lastLineGlyph = [...result.glyphs].reverse().find(g => g.y === line.baselineY) ?? selectedGlyphsOnLine[selectedGlyphsOnLine.length - 1]!;
-                            endX = lastLineGlyph.x + lastLineGlyph.fontSize * 0.6 + 8;
-                            // clamp to column width
-                            endX = Math.min(endX, line.startX + line.width);
-                            // The selection starts on this line
-                            if (minOffset >= line.startOffset) {
-                                startX = selectedGlyphsOnLine[0]!.x;
-                            }
-
-                            // The selection ends on this line
-                            if (maxOffset <= line.endOffset) {
-                                const lastGlyph = selectedGlyphsOnLine[selectedGlyphsOnLine.length - 1]!;
-                                endX = lastGlyph.x + lastGlyph.fontSize * 0.6; // approx advance
-                            } else {
-                                // Selection continues to next line, add a little tail
-                                const lastGlyph = selectedGlyphsOnLine[selectedGlyphsOnLine.length - 1]!;
-                                endX = Math.min(line.startX + line.width, lastGlyph.x + lastGlyph.fontSize * 0.6 + 8);
-                            }
-
-                            if (endX > startX) {
-                                const h = line.lineHeight;
-                                const y = line.baselineY - h * 0.8;
-                                ctx.fillRect(startX, y, endX - startX, h);
-                            }
-                        } else if (minOffset < line.startOffset && maxOffset > line.endOffset) {
-                            // Line is completely encompassed by the selection but has no printable glyphs (e.g., empty line or spaces)
-                            const h = line.lineHeight;
-                            const y = line.baselineY - h * 0.8;
-
-                            // To avoid highlighting massive empty expanses on rows with very few characters
-                            // We find the last glyph printed on this line, if any, to constrain the highlight box
-                            let fillWidth = line.width;
-                            const lineGlyphs = result.glyphs.filter(g => g.y === line.baselineY);
-                            if (lineGlyphs.length > 0) {
-                                const lastGlyph = lineGlyphs[lineGlyphs.length - 1]!;
-                                fillWidth = Math.min(fillWidth, (lastGlyph.x - line.startX) + (lastGlyph.fontSize * 0.6) + 8);
-                            }
-
-                            ctx.fillRect(line.startX, y, fillWidth, h);
-                        }
-                    }
+        // Collect contiguous glyph groups (split on column gaps > 20pt)
+        const rectGroups: Array<typeof result.glyphs> = [];
+        for (const lineGlyphs of linesMap.values()) {
+            lineGlyphs.sort((a, b) => a.x - b.x);
+            let groupStart = 0;
+            for (let i = 1; i < lineGlyphs.length; i++) {
+                const prev = lineGlyphs[i - 1]!;
+                const curr = lineGlyphs[i]!;
+                // Gap larger than ~1 character = different column; start new rect group
+                if (curr.x - (prev.x + prev.advance) > 20) {
+                    rectGroups.push(lineGlyphs.slice(groupStart, i));
+                    groupStart = i;
                 }
             }
+            rectGroups.push(lineGlyphs.slice(groupStart));
+        }
+
+        for (const group of rectGroups) {
+            if (group.length === 0) continue;
+            const first = group[0]!;
+            const last = group[group.length - 1]!;
+
+            const lineH = first.fontSize * 1.2;
+            const width = (last.x - first.x) + last.advance;
+            const h = Math.max(lineH, first.fontSize * 1.1);
+            const y = first.y - first.fontSize * 0.85;
+
+            ctx.fillRect(first.x, y, width, h);
         }
     }
 

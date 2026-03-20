@@ -111,7 +111,6 @@ export class ParagraphComposer {
             ? () => lineWidth
             : lineWidth;
 
-        // Settings from typeset
         const options = {
             demerits: { line: 10, flagged: 100, fitness: 3000 },
             tolerance: tolerance
@@ -137,8 +136,6 @@ export class ParagraphComposer {
 
         function computeCost(end: number, active: Breakpoint, currentLine: number): number {
             let width = sum.width - active.totals.width;
-            let stretch = 0;
-            let shrink = 0;
             const lineLength = getLineWidth(currentLine);
 
             const endNode = nodes[end];
@@ -147,21 +144,21 @@ export class ParagraphComposer {
             }
 
             if (width < lineLength) {
-                stretch = sum.stretch - active.totals.stretch;
+                const stretch = sum.stretch - active.totals.stretch;
                 if (stretch > 0) {
                     return (lineLength - width) / stretch;
                 } else {
                     return infinity;
                 }
             } else if (width > lineLength) {
-                shrink = sum.shrink - active.totals.shrink;
+                const shrink = sum.shrink - active.totals.shrink;
                 if (shrink > 0) {
                     return (lineLength - width) / shrink;
                 } else {
                     return infinity;
                 }
             } else {
-                return 0; // perfect match
+                return 0;
             }
         }
 
@@ -212,7 +209,6 @@ export class ParagraphComposer {
                             demerits = Math.pow(options.demerits.line + badness, 2);
                         }
 
-                        // Support for hyphenation flag (we don't emit this yet but algorithm supports it)
                         const flagged = (n: KnuthPlassElement | undefined) => n?.type === 'penalty' && (n as any).flagged ? 1 : 0;
                         if (node.type === 'penalty' && nodes[active.data.position]?.type === 'penalty') {
                             demerits += options.demerits.flagged * flagged(node) * flagged(nodes[active.data.position]);
@@ -286,8 +282,6 @@ export class ParagraphComposer {
 
             let finalBrk = tmp ? tmp.data : null;
             while (finalBrk !== null) {
-                // If it's the very first dummy breakpoint at 0, don't include it in final array
-                // typeset includes it but we usually start breaks from > 0
                 if (finalBrk.position > 0) {
                     breaks.unshift({
                         breakIndex: finalBrk.position,
@@ -301,119 +295,157 @@ export class ParagraphComposer {
             return breaks;
         }
 
-        // If it failed to layout, try doubling the tolerance
         if (tolerance < 100) return this.compose(nodes, lineWidth, tolerance * 2);
 
         return [];
     }
 }
 
+// ── GreedyComposer ────────────────────────────────────────────────────────────
+
+/**
+ * Simple first-fit (greedy) line breaker.
+ *
+ * Computes a proper `adjustmentRatio` so that _positionGlyphs can correctly
+ * stretch / shrink glue for justified text.
+ */
 export class GreedyComposer {
     compose(
         elements: KnuthPlassElement[],
-        lineWidth: number | ((lineNumber: number) => number)
+        lineWidth: number | ((lineNumber: number) => number),
     ): LineBreak[] {
-        const getLineWidth = typeof lineWidth === 'number' ? () => lineWidth : lineWidth;
+        const getWidth = typeof lineWidth === 'number' ? () => lineWidth : lineWidth;
         const breaks: LineBreak[] = [];
+
         let currentWidth = 0;
         let lastBreakOpportunity = -1;
+
+        // Track box/glue totals for the current line (for adjustmentRatio computation)
+        let lineBoxW    = 0;
+        let lineGlueW   = 0;
+        let lineStretch = 0;
+        let lineShrink  = 0;
+
+        // Snapshot at the last legal break opportunity
+        let snapBoxW    = 0;
+        let snapGlueW   = 0;
+        let snapStretch = 0;
+        let snapShrink  = 0;
+
+        const computeRatio = (targetW: number): number => {
+            const nat = snapBoxW + snapGlueW;
+            if (nat < targetW && snapStretch > 0) return (targetW - nat) / snapStretch;
+            if (nat > targetW && snapShrink  > 0) return (targetW - nat) / snapShrink;
+            return 0;
+        };
+
+        const resetLine = () => {
+            currentWidth = 0;
+            lastBreakOpportunity = -1;
+            lineBoxW = lineGlueW = lineStretch = lineShrink = 0;
+            snapBoxW = snapGlueW = snapStretch = snapShrink = 0;
+        };
 
         for (let i = 0; i < elements.length; i++) {
             const el = elements[i]!;
 
-            if (el.type === 'penalty' && el.penalty === -10000) {
-                // Forced break
+            // ── Forced break ──────────────────────────────────────────────────
+            if (el.type === 'penalty' && (el as { penalty: number }).penalty === -10000) {
+                snapBoxW = lineBoxW; snapGlueW = lineGlueW;
+                snapStretch = lineStretch; snapShrink = lineShrink;
                 breaks.push({
                     breakIndex: i,
-                    adjustmentRatio: 0,
+                    adjustmentRatio: 0, // Last line — no forced stretch
                     fitnessClass: 1,
-                    totalDemerits: 0
+                    totalDemerits: 0,
                 });
-                currentWidth = 0;
-                lastBreakOpportunity = -1;
+                resetLine();
                 continue;
             }
 
-            // Track break opportunities (glue or valid penalty)
-            if (el.type === 'glue' || (el.type === 'penalty' && el.penalty >= 0 && el.penalty < 10000)) {
+            // ── Track legal break opportunities ───────────────────────────────
+            if (el.type === 'glue' ||
+                (el.type === 'penalty' &&
+                 (el as { penalty: number }).penalty >= 0 &&
+                 (el as { penalty: number }).penalty < 10000)) {
                 lastBreakOpportunity = i;
+                snapBoxW    = lineBoxW;
+                snapGlueW   = lineGlueW;
+                snapStretch = lineStretch;
+                snapShrink  = lineShrink;
             }
 
-            const elementWidth = el.type === 'box' || el.type === 'glue' ? el.width : 0;
+            const elW = (el.type === 'box' || el.type === 'glue') ? el.width : 0;
 
-            // Check if adding this element exceeds the limit
-            if (currentWidth + elementWidth > getLineWidth(breaks.length + 1)) {
+            // ── Overflow check ────────────────────────────────────────────────
+            if (currentWidth + elW > getWidth(breaks.length + 1)) {
                 if (currentWidth === 0) {
-                    // If we are at the beginning of a line and the element *itself* is wider than the slot,
-                    // it means the slot is just too narrow (likely next to a polygon wrap object).
-                    // We peek ahead to see if the polygon clears up giving us a wider slot.
-                    let foundWiderSlot = false;
+                    // Element alone is wider than the slot (polygon wrap scenario).
+                    let found = false;
                     for (let peek = 1; peek <= 20; peek++) {
-                        if (getLineWidth(breaks.length + 1 + peek) >= elementWidth) {
-                            foundWiderSlot = true;
-                            break;
-                        }
+                        if (getWidth(breaks.length + 1 + peek) >= elW) { found = true; break; }
                     }
-
-                    if (foundWiderSlot) {
-                        // Skip this narrow line entirely by emitting an empty break
+                    if (found) {
+                        snapBoxW = snapGlueW = snapStretch = snapShrink = 0;
                         breaks.push({
                             breakIndex: i > 0 ? i - 1 : 0,
                             adjustmentRatio: 0,
                             fitnessClass: 1,
-                            totalDemerits: 0
+                            totalDemerits: 0,
                         });
-                        i--; // Re-evaluate this element for the new (next) line
+                        resetLine();
+                        i--; // Re-evaluate this element for the next slot
                         continue;
                     }
-                    // If no wider slot is coming up, just force it here and let it geometrically overflow.
-                    // We do nothing else so currentWidth += elementWidth happens below.
+                    // No wider slot ahead — let it overflow naturally
+                } else if (lastBreakOpportunity !== -1) {
+                    const target = getWidth(breaks.length + 1);
+                    breaks.push({
+                        breakIndex: lastBreakOpportunity,
+                        adjustmentRatio: computeRatio(target),
+                        fitnessClass: 1,
+                        totalDemerits: 0,
+                    });
+                    i = lastBreakOpportunity;
+                    resetLine();
+                    continue;
                 } else {
-                    // We must break.
-                    if (lastBreakOpportunity !== -1) {
-                        // Break at the last opportunity
-                        breaks.push({
-                            breakIndex: lastBreakOpportunity,
-                            adjustmentRatio: 0,
-                            fitnessClass: 1,
-                            totalDemerits: 0
-                        });
-
-                        // The line is now broken at lastBreakOpportunity.
-                        // We must re-process elements from lastBreakOpportunity + 1.
-                        i = lastBreakOpportunity;
-                        currentWidth = 0;
-                        lastBreakOpportunity = -1;
-                        continue;
-                    } else {
-                        // No break opportunity found on this line! A very long word spanning multiple elements.
-                        const forceBreakIndex = i > 0 ? i - 1 : i;
-                        breaks.push({
-                            breakIndex: forceBreakIndex,
-                            adjustmentRatio: 0,
-                            fitnessClass: 1,
-                            totalDemerits: 0
-                        });
-                        i = forceBreakIndex;
-                        currentWidth = 0;
-                        lastBreakOpportunity = -1;
-                        continue;
-                    }
+                    // No legal break — force one before current element
+                    const fb = i > 0 ? i - 1 : i;
+                    snapBoxW = lineBoxW; snapGlueW = lineGlueW;
+                    snapStretch = lineStretch; snapShrink = lineShrink;
+                    breaks.push({
+                        breakIndex: fb,
+                        adjustmentRatio: computeRatio(getWidth(breaks.length + 1)),
+                        fitnessClass: 1,
+                        totalDemerits: 0,
+                    });
+                    i = fb;
+                    resetLine();
+                    continue;
                 }
             }
 
-            currentWidth += elementWidth;
+            // ── Accumulate ────────────────────────────────────────────────────
+            if (el.type === 'box') {
+                lineBoxW += el.width;
+            } else if (el.type === 'glue') {
+                lineGlueW   += el.width;
+                lineStretch += el.stretch;
+                lineShrink  += el.shrink;
+            }
+            currentWidth += elW;
         }
 
-        // Add a final break for any remaining elements if the paragraph didn't end with a forced penalty
-        if (currentWidth > 0 && elements.length > 0) {
+        // Flush last (partial) line — ratio 0 (no forced stretch on last line)
+        if (currentWidth > 0 || lineBoxW > 0) {
             const lastIdx = elements.length - 1;
             if (breaks.length === 0 || breaks[breaks.length - 1]!.breakIndex !== lastIdx) {
                 breaks.push({
                     breakIndex: lastIdx,
                     adjustmentRatio: 0,
                     fitnessClass: 1,
-                    totalDemerits: 0
+                    totalDemerits: 0,
                 });
             }
         }

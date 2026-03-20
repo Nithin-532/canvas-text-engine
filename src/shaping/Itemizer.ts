@@ -20,6 +20,7 @@ export interface TextRun {
     style: CharacterStyle;
     direction: 'ltr' | 'rtl';
     script: string;
+    isInlineObject?: boolean;
 }
 
 /**
@@ -137,6 +138,7 @@ export class Itemizer {
             const charStyle = story.getCharacterStyleAt(startOffset + i);
             const script = detectScript(cp);
             const dir = detectDirection(cp);
+            const isInlineObj = cp === 0xFFFC;
 
             // Determine effective script (inherit for common chars)
             const effectiveScript = script === 'Zyyy' ? currentScript : script;
@@ -147,8 +149,8 @@ export class Itemizer {
             const scriptChanged = effectiveScript !== currentScript && script !== 'Zyyy';
             const dirChanged = effectiveDir !== currentDirection && dir !== 'neutral';
 
-            if ((styleChanged || scriptChanged || dirChanged) && i > runStart) {
-                // Flush the current run
+            // If we hit an inline object, OR if style/script/dir changed, flush the current run
+            if ((styleChanged || scriptChanged || dirChanged || isInlineObj) && i > runStart) {
                 runs.push({
                     text: text.slice(runStart, i),
                     startOffset: startOffset + runStart,
@@ -164,6 +166,23 @@ export class Itemizer {
             } else {
                 if (script !== 'Zyyy') currentScript = effectiveScript;
                 if (dir !== 'neutral') currentDirection = effectiveDir;
+            }
+
+            // If the current character is itself an inline object, emit it immediately as a 1-length run
+            if (isInlineObj) {
+                runs.push({
+                    text: text.slice(i, i + 1),
+                    startOffset: startOffset + i,
+                    endOffset: startOffset + i + 1,
+                    style: charStyle,
+                    direction: currentDirection,
+                    script: currentScript,
+                    isInlineObject: true,
+                });
+                runStart = i + 1;
+                if (runStart < text.length) {
+                    currentStyle = story.getCharacterStyleAt(startOffset + runStart);
+                }
             }
 
             // Handle surrogate pairs (codepoints > 0xFFFF use 2 UTF-16 code units)

@@ -39,6 +39,11 @@ export class LayoutEngine {
     private _status: EngineStatus;
     private _lastResult: LayoutResult | null = null;
 
+    /** Cache for shaped paragraphs: key = paragraph text + style hash, value = shaped result */
+    private _shapingCache: Map<string, import('../types').ShapedParagraph> = new Map();
+    /** Story version when the shaping cache was last fully validated */
+    private _lastShapingVersion: number = -1;
+
     constructor(config: EngineConfig) {
         this._config = config;
         this._story = new Story('', config.defaultCharacterStyle, config.defaultParagraphStyle);
@@ -118,6 +123,8 @@ export class LayoutEngine {
      */
     setText(text: string): void {
         this._story = new Story(text, this._config.defaultCharacterStyle, this._config.defaultParagraphStyle);
+        this._shapingCache.clear();
+        this._lastShapingVersion = -1;
     }
 
     // ── Configuration ──
@@ -165,28 +172,121 @@ export class LayoutEngine {
         }
 
         const startTime = performance.now();
+        const result = this._composeInternal(this._story, this._frameManager, this._config);
+        result.composeTimeMs = performance.now() - startTime;
+        this._lastResult = result;
+        return result;
+    }
 
-        // Step 1: Shape the story
-        const shapedParagraphs = this._shapingPipeline.shapeStory(this._story);
+    private _composeInternal(story: Story, frameManager: FrameManager, config: EngineConfig): LayoutResult {
+        // Pre-pass: layout any inline tables first so their heights are finalized
+        for (const obj of story.getInlineObjects().values()) {
+            if (obj.type === 'table') {
+                const table = obj as import('../core/Table').Table;
+                // Cell stories must NOT inherit the main story's wrap objects —
+                // their frame geometry is isolated (starts at 0,0) so wrap polygons
+                // from the main canvas would occlude text in cell coordinates.
+                const cellConfig = { ...config, wrapObjects: [] };
+                for (let r = 0; r < table.rows; r++) {
+                    let maxRowHeight = 0;
+                    for (let c = 0; c < table.cols; c++) {
+                        const cell = table.getCell(r, c);
+                        if (!cell) continue;
+
+                        // Skip merged-away cells - they don't have their own content
+                        if (cell.isMergedAway) continue;
+
+                        // Calculate layout for this specific cell's isolated story & frame manager
+                        const cellResult = this._composeInternal(cell.story, cell.frameManager, cellConfig);
+                        cell.layoutResult = cellResult;
+
+                        // Determine the physical height this cell consumed
+                        let cellHeight = 0;
+                        for (const frame of cellResult.frames) {
+                            for (const col of frame.columns) {
+                                if (col.lines.length > 0) {
+                                    const lastLine = col.lines[col.lines.length - 1]!;
+                                    const bottom = lastLine.baselineY + (lastLine.lineHeight * 0.3);
+                                    if (bottom > cellHeight) cellHeight = bottom;
+                                }
+                            }
+                        }
+                        // Add cell padding (top + bottom)
+                        const s = cell.style;
+                        cellHeight += s.paddingTop + s.paddingBottom;
+
+                        // Overset detection for 'exactly' mode
+                        if (table.rowHeightMode === 'exactly') {
+                            cell.isOverset = cellHeight > table.minRowHeight;
+                        } else {
+                            cell.isOverset = false;
+                        }
+
+                        if (cellHeight > maxRowHeight) maxRowHeight = cellHeight;
+                    }
+                    // Apply the maximum required height to the entire row
+                    table.setRowHeight(r, maxRowHeight);
+                }
+            }
+        }
+
+        // Step 1: Shape the story (with paragraph-level caching)
+        const paragraphs = story.getParagraphs();
+        const shapedParagraphs: import('../types').ShapedParagraph[] = [];
+        const storyVersion = story.version;
+        const isMainStory = story === this._story;
+        const newCache = isMainStory ? new Map<string, import('../types').ShapedParagraph>() : null;
+
+        for (const para of paragraphs) {
+            // A \n that immediately follows text is a paragraph terminator, not a blank line.
+            // It produces a trailing empty paragraph whose startOffset equals story.length.
+            // Skip it — only a \n that follows another \n (startOffset < story.length) is a
+            // genuine blank line and should contribute line height.
+            if (para.text === '' && para.startOffset >= story.length) continue;
+
+            // Build a cache key from the paragraph text + its resolved style
+            const paraStyle = story.getParagraphStyleAt(para.startOffset);
+            const cacheKey = isMainStory
+                ? `${para.startOffset}:${para.text.length}:${paraStyle.alignment}:${paraStyle.leading}:${paraStyle.composer}:${paraStyle.tolerance}:${paraStyle.spaceBefore}:${paraStyle.spaceAfter}:${paraStyle.firstLineIndent}:${paraStyle.leftIndent}:${paraStyle.rightIndent}:${storyVersion}`
+                : '';
+
+            // Check cache (only for the main story — cell stories are small enough)
+            if (isMainStory && this._lastShapingVersion === storyVersion && this._shapingCache.has(cacheKey)) {
+                const cached = this._shapingCache.get(cacheKey)!;
+                shapedParagraphs.push(cached);
+                newCache!.set(cacheKey, cached);
+                continue;
+            }
+
+            const shaped = this._shapingPipeline.shapeParagraph(para.text, para.startOffset, story);
+            shapedParagraphs.push(shaped);
+            if (newCache) newCache.set(cacheKey, shaped);
+        }
+
+        // Swap cache
+        if (isMainStory && newCache) {
+            this._shapingCache = newCache;
+            this._lastShapingVersion = storyVersion;
+        }
 
         // Step 2+3+4: For each paragraph, build elements, compose, and flow
-        const firstFrame = this._frameManager.getFirstFrame();
+        const firstFrame = frameManager.getFirstFrame();
 
         if (!firstFrame) {
             return {
                 frames: [],
                 glyphs: [],
-                composeTimeMs: performance.now() - startTime,
+                composeTimeMs: 0,
                 lineCount: 0,
                 glyphCount: 0,
             };
         }
 
         // Set wrap objects BEFORE compose so buildLineWidthFn works below.
-        this._flowManager.setWrapObjects(this._config.wrapObjects ?? []);
+        this._flowManager.setWrapObjects(config.wrapObjects ?? []);
 
         // Accumulate all composed lines across all paragraphs
-        let allLines: ComposedLine[] = [];
+        const allLines: ComposedLine[] = [];
 
         for (const shaped of shapedParagraphs) {
             const fullColumnWidth = firstFrame.getColumnWidth();
@@ -195,18 +295,26 @@ export class LayoutEngine {
             // Each line number (1-based) maps to the available width at the exact
             // simulated Y position where that line will land.
             const approxLineHeight = shaped.paragraphStyle.leading *
-                (shaped.runs[0]?.style.fontSize ?? this._config.defaultCharacterStyle.fontSize ?? 14);
+                (shaped.runs[0]?.style.fontSize ?? config.defaultCharacterStyle.fontSize ?? 14);
 
             const lineWidths = this._flowManager.buildLineWidthsForParagraph(
                 allLines,
-                this._frameManager,
+                frameManager,
                 firstFrame.id,
                 approxLineHeight
             );
 
+            // Fallback width: last known width from the precomputed array (avoids using a
+            // potentially wrong firstFrame column width when deeper frames are narrower).
+            const fallbackWidth = lineWidths[lineWidths.length - 1] ?? fullColumnWidth;
+            const leftInd = shaped.paragraphStyle.leftIndent ?? 0;
+            const rightInd = shaped.paragraphStyle.rightIndent ?? 0;
+            const fli = shaped.paragraphStyle.firstLineIndent ?? 0;
             const lineWidthFn = (lineNumber: number) => {
                 const idx = Math.max(0, lineNumber - 1);
-                return lineWidths[idx] ?? fullColumnWidth;
+                const base = lineWidths[idx] ?? fallbackWidth;
+                const firstLineExtra = lineNumber === 1 ? fli : 0;
+                return Math.max(1, base - leftInd - rightInd - firstLineExtra);
             };
 
             const elements = buildElements(
@@ -233,11 +341,11 @@ export class LayoutEngine {
                 breaks = this._greedyComposer.compose(elements, lineWidthFn);
             }
 
-
             if (!breaks || breaks.length === 0) continue;
 
             // Build lines for this paragraph and append to total
-            const lines = this._flowManager.buildComposedLines(elements, breaks, shaped.paragraphStyle);
+            const paraFontSize = shaped.runs[0]?.style.fontSize ?? config.defaultCharacterStyle.fontSize ?? 14;
+            const lines = this._flowManager.buildComposedLines(elements, breaks, shaped.paragraphStyle, paraFontSize);
             allLines.push(...lines);
         }
 
@@ -245,12 +353,26 @@ export class LayoutEngine {
         // (wrap objects were already set above before composing)
         const result = this._flowManager.distribute(
             allLines,
-            this._frameManager,
+            frameManager,
             firstFrame.id,
         );
 
-        result.composeTimeMs = performance.now() - startTime;
-        this._lastResult = result;
+        // Flatten inline object nested glyphs into this layout result
+        const nestedGlyphs: import('../types').PositionedGlyph[] = [];
+        for (const g of result.glyphs) {
+            g.story = story;
+            if (g.isInlineObject && g.inlineObject && g.inlineObject.type === 'table') {
+                const table = g.inlineObject as import('../core/Table').Table;
+                const metrics = table.getMetrics();
+                const tableX = g.x;
+                const tableY = g.y - metrics.ascent;
+                for (const childGlyph of table.getNestedGlyphs(tableX, tableY)) {
+                    nestedGlyphs.push(childGlyph);
+                }
+            }
+        }
+        result.glyphs.push(...nestedGlyphs);
+
         return result;
     }
 
@@ -258,19 +380,74 @@ export class LayoutEngine {
 
     /**
      * Hit testing: map absolute (x, y) coordinates to a source text offset.
-     * Returns -1 if no character is hit or if distance is too large.
+     * Returns null if no character is hit or if distance is too large.
      */
-    hitTest(x: number, y: number): number {
-        if (!this._lastResult || this._lastResult.glyphs.length === 0) return -1;
+    hitTest(x: number, y: number): { offset: number; story: import('../core/Story').Story } | null {
+        if (!this._lastResult || this._lastResult.glyphs.length === 0) return null;
 
+        // ── Pass 1: Check if click is inside a table cell ──
+        // This takes priority so that clicking inside a table always targets the cell,
+        // even if a main-story glyph happens to be geometrically closer.
+        for (const g of this._lastResult.glyphs) {
+            if (!g.isInlineObject || !g.inlineObject || g.inlineObject.type !== 'table') continue;
+            const table = g.inlineObject as import('../core/Table').Table;
+            const metrics = table.getMetrics();
+            const tableX = g.x;
+            const tableY = g.y - metrics.ascent;
+
+            // Check if point is within the table bounds
+            if (x < tableX || x > tableX + metrics.width || y < tableY || y > tableY + metrics.height) continue;
+
+            // Find which cell the point falls in
+            let cellY = tableY;
+            for (let r = 0; r < table.rows; r++) {
+                const rowH = table.getRowHeight(r);
+                let cellX = tableX;
+                for (let c = 0; c < table.cols; c++) {
+                    const colW = table.getColumnWidth(c);
+                    if (x >= cellX && x <= cellX + colW && y >= cellY && y <= cellY + rowH) {
+                        // Get the anchor cell (handles merged cells)
+                        const cell = table.getAnchorCell(r, c);
+                        if (cell) {
+                            // Try to find the closest glyph within this specific cell
+                            const cellGlyphs = this._lastResult!.glyphs.filter(
+                                cg => cg.story === cell.story
+                            );
+                            if (cellGlyphs.length > 0) {
+                                let bestOffset = 0;
+                                let bestDist = Infinity;
+                                for (const cg of cellGlyphs) {
+                                    const cgx = cg.x + cg.advance / 2;
+                                    const cgy = cg.y - cg.fontSize / 2;
+                                    const d = (x - cgx) ** 2 + (y - cgy) ** 2;
+                                    if (d < bestDist) {
+                                        bestDist = d;
+                                        bestOffset = cg.charOffset;
+                                        if (x > cg.x + cg.advance / 2) {
+                                            bestOffset = cg.charOffset + 1;
+                                        }
+                                    }
+                                }
+                                return { offset: bestOffset, story: cell.story };
+                            }
+                            // Empty cell — place cursor at position 0
+                            return { offset: 0, story: cell.story };
+                        }
+                    }
+                    cellX += colW;
+                }
+                cellY += rowH;
+            }
+        }
+
+        // ── Pass 2: Closest glyph in main story ──
         let closestOffset = -1;
+        let closestStory: import('../core/Story').Story | undefined = undefined;
         let minDistance = Infinity;
 
-        // Find the closest glyph
         for (const glyph of this._lastResult.glyphs) {
-            // Glyph origin is at the baseline (bottom left)
-            const gx = glyph.x;
-            const gy = glyph.y - glyph.fontSize / 2; // Approximate center of glyph vertically
+            const gx = glyph.x + glyph.advance / 2;
+            const gy = glyph.y - glyph.fontSize / 2;
 
             const dx = x - gx;
             const dy = y - gy;
@@ -279,19 +456,19 @@ export class LayoutEngine {
             if (dist < minDistance) {
                 minDistance = dist;
                 closestOffset = glyph.charOffset;
+                closestStory = glyph.story;
 
-                // Cursor should go after the character if hit is on its right half
-                if (dx > glyph.fontSize / 3) {
+                if (x > glyph.x + glyph.advance / 2) {
                     closestOffset = glyph.charOffset + 1;
                 }
             }
         }
 
-        if (minDistance < 10000) { // arbitrary threshold ~100px
-            return closestOffset;
+        if (minDistance < 10000) {
+            return { offset: closestOffset, story: closestStory ?? this._story };
         }
 
-        return -1;
+        return null;
     }
 
     // ── Cleanup ──

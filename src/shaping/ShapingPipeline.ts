@@ -63,7 +63,7 @@ export class ShapingPipeline {
         const textRuns = this._itemizer.itemize(text, startOffset, story);
 
         // Step 3: Shape each run with HarfBuzz
-        const shapedRuns = textRuns.map((run) => this._shapeRun(run));
+        const shapedRuns = textRuns.map((run) => this._shapeRun(run, story));
 
         // Step 4: Assemble the ShapedParagraph
         return {
@@ -75,9 +75,46 @@ export class ShapingPipeline {
     }
 
     /**
-     * Shape a single text run using HarfBuzz.
+     * Shape a single text run using HarfBuzz, or bypass it for InlineObjects.
      */
-    private _shapeRun(run: TextRun): ShapedRun {
+    private _shapeRun(run: TextRun, story: Story): ShapedRun {
+        if (run.isInlineObject) {
+            const inlineObj = story.getInlineObjectAt(run.startOffset);
+            if (!inlineObj) {
+                console.warn(`[ShapingPipeline] Warning! Inline object at ${run.startOffset} is missing from Story registry!`);
+                // Should never happen if data model is intact, but provide fallback
+                return {
+                    startOffset: run.startOffset,
+                    endOffset: run.endOffset,
+                    glyphs: [],
+                    totalAdvance: 0,
+                    style: run.style,
+                };
+            }
+
+            const metrics = inlineObj.getMetrics();
+            const fakeGlyph: ShapedGlyph = {
+                glyphId: 0,
+                // HarfBuzz clusters are relative to the text string passed to it. 
+                // Since an inline object run is exactly 1 character long, its cluster is 0.
+                cluster: 0,
+                xAdvance: metrics.width,
+                yAdvance: 0,
+                xOffset: 0,
+                yOffset: 0,
+                isInlineObject: true,
+                inlineObject: inlineObj,
+            };
+
+            return {
+                startOffset: run.startOffset,
+                endOffset: run.endOffset,
+                glyphs: [fakeGlyph],
+                totalAdvance: metrics.width,
+                style: run.style,
+            };
+        }
+
         const glyphs = this._fontManager.shapeText(
             run.text,
             run.style,

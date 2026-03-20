@@ -9,13 +9,18 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { LayoutEngine } from '../layout/LayoutEngine';
 import { CanvasRenderer } from '../renderer/CanvasRenderer';
 import { WebGLRenderer } from '../renderer/WebGLRenderer';
-import { WebGPURenderer, isWebGPUAvailable } from '../renderer/WebGPURenderer';
+import { NullGPURenderer } from '../renderer/NullGPURenderer';
 import type { IGPURenderer } from '../renderer/GPURendererInterface';
 import { MSDFAtlasGenerator } from '../renderer/MSDFAtlasGenerator';
 import type { MSDFAtlas } from '@zappar/msdf-generator';
-import type { LayoutResult, ComposerType, TextAlignment, WrapObject } from '../types';
+import type { ComposerType, TextAlignment, WrapObject } from '../types';
 import { DEFAULT_ENGINE_CONFIG } from '../types';
 import { makeEllipsePolygon } from '../geometry/Polygon';
+import { Table, getTablePresetStyle } from '../core/Table';
+import type { TablePreset } from '../core/Table';
+import type { RowHeightMode } from '../types';
+import { parseLSXMLJson } from '../idml/JSONParser';
+import type { IDMLGraphicLine } from '../idml/JSONParser';
 
 const SAMPLE_TEXT = `Typography is the art and technique of arranging type to make written language legible, readable, and appealing when displayed. The arrangement of type involves selecting typefaces, point sizes, line lengths, line-spacing (leading), and letter-spacing (tracking), as well as adjusting the space between pairs of letters (kerning).
 
@@ -55,13 +60,33 @@ export function App() {
     const gpuRendererRef = useRef<IGPURenderer | null>(null);
     const msdfGenRef = useRef<MSDFAtlasGenerator | null>(null);
     const atlasRef = useRef<MSDFAtlas | null>(null);
-    const [gpuBackend, setGpuBackend] = useState<'webgl' | 'webgpu'>('webgl');
+    const boldAtlasRef = useRef<MSDFAtlas | null>(null);
+    const robotoTTFRef = useRef<ArrayBuffer | null>(null);
+    const robotoBoldTTFRef = useRef<ArrayBuffer | null>(null);
+    const baseCharsetRef = useRef<string>('');
+    /** True when GPU acceleration is unavailable and Canvas 2D handles text rendering */
+    const canvas2DTextRef = useRef(false);
+    const [gpuBackend, setGpuBackend] = useState<'webgl' | 'canvas2d'>('webgl');
 
     const [status, setStatus] = useState<string>('Initializing...');
     const [statusDot, setStatusDot] = useState<'loading' | 'ok' | 'error'>('loading');
-    const [layoutResult, setLayoutResult] = useState<LayoutResult | null>(null);
+    const [layoutResult, setLayoutResult] = useState<import('../types').LayoutResult | null>(null);
     const [selection, setSelection] = useState<[number, number] | null>(null);
+    const [activeStory, _setActiveStory] = useState<import('../core/Story').Story | null>(null);
+    const activeStoryRef = useRef<import('../core/Story').Story | null>(null);
+    const setActiveStory = useCallback((s: import('../core/Story').Story | null) => {
+        activeStoryRef.current = s;
+        _setActiveStory(s);
+    }, []);
     const [isDragging, setIsDragging] = useState(false);
+
+    // ── Dynamic paper dimensions (updated when loading IDML/JSON) ──
+    const [paperWidth, setPaperWidth] = useState(DEFAULT_ENGINE_CONFIG.paperWidth);
+    const [paperHeight, setPaperHeight] = useState(DEFAULT_ENGINE_CONFIG.paperHeight);
+    const [isLoadingJSON, setIsLoadingJSON] = useState(false);
+    const [isJSONMode, setIsJSONMode] = useState(false);
+    /** Graphic lines (rules/borders) from IDML or JSON — rendered as canvas overlays */
+    const graphicLinesRef = useRef<IDMLGraphicLine[]>([]);
 
     // ── Zoom / Pan state ────────────────────────────────────────
     const [zoom, setZoom] = useState(1.0);
@@ -86,6 +111,14 @@ export function App() {
     const [tolerance, setTolerance] = useState(2);
     const [opticalMargins, setOpticalMargins] = useState(false);
     const [hzProgramEnabled, setHzProgramEnabled] = useState(false);
+
+    // ── Table Controls ──────────────────────────────────────────
+    const [tableRows, setTableRows] = useState(3);
+    const [tableCols, setTableCols] = useState(3);
+    const [tablePreset, setTablePreset] = useState<TablePreset>('headerStriped');
+    const [tableRowHeightMode, setTableRowHeightMode] = useState<RowHeightMode>('atLeast');
+    const [tableCellPadding, setTableCellPadding] = useState(5);
+    const [activeTableRef, setActiveTableRef] = useState<Table | null>(null);
 
     // ── Polygon / Wrap state ────────────────────────────────────
     const [polygons, setPolygons] = useState<ManagedPolygon[]>([
@@ -136,6 +169,7 @@ export function App() {
     // Keep zoom in a ref so recompose doesn't depend on it (zoom is visual-only)
     const zoomRef = useRef(zoom);
     zoomRef.current = zoom;
+    const pendingRecomposeRef = useRef<number | null>(null);
 
     const recompose = useCallback((wraps?: WrapObject[]) => {
         const engine = engineRef.current;
@@ -145,33 +179,51 @@ export function App() {
 
         if (!engine || !uiRenderer || !glRenderer || engine.status.state !== 'ready') return;
 
-        const wrapObjects = wraps ?? activeWrapObjects;
+        // In JSON mode: keep existing frames and use no polygon wraps
+        const wrapObjects = isJSONMode ? [] : (wraps ?? activeWrapObjects);
 
-        engine.updateConfig({
-            frames: [{
-                ...DEFAULT_ENGINE_CONFIG.frames[0]!,
-                columns,
-                columnGap,
-            }],
-            wrapObjects,
-        });
+        if (!isJSONMode) {
+            engine.updateConfig({
+                frames: [{
+                    ...DEFAULT_ENGINE_CONFIG.frames[0]!,
+                    columns,
+                    columnGap,
+                }],
+                wrapObjects,
+            });
+        }
 
-        uiRenderer.updateConfig({ showColumns, showBaselines, drawText: false });
+        // When WebGL is unavailable Canvas 2D renders text; otherwise WebGL does it
+        uiRenderer.updateConfig({ showColumns, showBaselines, drawText: canvas2DTextRef.current });
 
         const result = engine.compose();
         setLayoutResult(result);
 
-        // Render MSDF text on bottom layer
+        // Always render text via WebGL MSDF (fast GPU path)
         glRenderer.setTransform(currentZoom, 0, 0);
         glRenderer.render(result, atlasRef.current);
 
-        // Render UI overlays on top layer, drawing the WebGL offscreen canvas onto it first
-        uiRenderer.render(result, engine.frameManager.allFrames, selection, wrapObjects, glRenderer.getCanvas(), currentZoom);
+        // Render UI overlays on top layer (cursor, frames, selection, etc.)
+        uiRenderer.render(result, engine.frameManager.allFrames, selection, wrapObjects, glRenderer.getCanvas(), currentZoom, activeStoryRef.current ?? engine.story);
+        // Draw graphic lines (rules, borders) from IDML/JSON on top of text
+        if (graphicLinesRef.current.length > 0) {
+            uiRenderer.drawGraphicLines(graphicLinesRef.current);
+        }
 
         setStatus(`Ready — ${result.lineCount} lines in ${result.composeTimeMs.toFixed(1)}ms`);
         setStatusDot('ok');
         return result;
-    }, [columns, columnGap, showColumns, showBaselines, selection, activeWrapObjects]);
+    }, [columns, columnGap, showColumns, showBaselines, selection, activeWrapObjects, activeStory]);
+
+    /** Deferred recompose — coalesces rapid calls (e.g. typing, held Backspace)
+     *  into a single layout pass per animation frame. */
+    const recomposeDeferred = useCallback(() => {
+        if (pendingRecomposeRef.current !== null) return; // already scheduled
+        pendingRecomposeRef.current = requestAnimationFrame(() => {
+            pendingRecomposeRef.current = null;
+            recompose();
+        });
+    }, [recompose]);
 
     // Re-render (without recomposing layout) when zoom changes
     useEffect(() => {
@@ -180,31 +232,40 @@ export function App() {
         const engine = engineRef.current;
         if (!glRenderer || !uiRenderer || !engine || !layoutResult) return;
 
+        const wraps = isJSONMode ? [] : activeWrapObjects;
+
+        // Always use WebGL for text rendering
         glRenderer.setTransform(zoom, 0, 0);
         glRenderer.render(layoutResult, atlasRef.current);
         uiRenderer.render(
             layoutResult,
             engine.frameManager.allFrames,
             selection,
-            activeWrapObjects,
+            wraps,
             glRenderer.getCanvas(),
-            zoom
+            zoom,
+            activeStoryRef.current ?? engine.story
         );
-    }, [zoom, layoutResult, selection, activeWrapObjects]);
+        if (graphicLinesRef.current.length > 0) {
+            uiRenderer.drawGraphicLines(graphicLinesRef.current);
+        }
+    }, [zoom, layoutResult, selection, activeWrapObjects, isJSONMode]);
 
 
     const updateStyle = useCallback((type: 'char' | 'para', partialStyle: any) => {
         const engine = engineRef.current;
         if (!engine) return;
+        const story = activeStory ?? engine.story;
         const targetStart = selection && selection[0] !== selection[1] ? Math.min(selection[0], selection[1]) : 0;
-        const targetEnd = selection && selection[0] !== selection[1] ? Math.max(selection[0], selection[1]) : engine.story.text.length;
+        const targetEnd = selection && selection[0] !== selection[1] ? Math.max(selection[0], selection[1]) : story.length;
+
         if (type === 'char') {
-            engine.story.applyCharacterStyle(targetStart, targetEnd, partialStyle);
+            story.applyCharacterStyle(targetStart, targetEnd - targetStart, partialStyle);
         } else {
-            engine.story.applyParagraphStyle(targetStart, targetEnd, partialStyle);
+            story.applyParagraphStyle(targetStart, targetEnd - targetStart, partialStyle);
         }
         recompose();
-    }, [selection, recompose]);
+    }, [selection, recompose, activeStory]);
 
     // ── Polygon management ──────────────────────────────────────
     const addDemoEllipse = useCallback(() => {
@@ -254,6 +315,238 @@ export function App() {
         setPolygons(prev => prev.map(p => p.id === id ? { ...p, padding } : p));
     }, []);
 
+    // ── Object Insertion ────────────────────────────────────────
+    const insertTable = useCallback(() => {
+        if (!engineRef.current || !selection) return;
+        const offset = Math.min(selection[0], selection[1]);
+
+        // InDesign default: Table spans the width of the active column
+        const frame = engineRef.current.frameManager.allFrames[0];
+        let tableWidth = 400;
+        if (frame) {
+            tableWidth = (frame.width - frame.columnGap * (frame.columns - 1)) / frame.columns;
+        }
+
+        const presetStyle = getTablePresetStyle(tablePreset);
+        const table = new Table({
+            id: `table-${Date.now()}`,
+            rows: tableRows,
+            cols: tableCols,
+            width: tableWidth,
+            rowHeightMode: tableRowHeightMode,
+            minRowHeight: 28,
+            tableStyle: presetStyle,
+            cellStyle: {
+                paddingTop: tableCellPadding,
+                paddingRight: tableCellPadding + 2,
+                paddingBottom: tableCellPadding,
+                paddingLeft: tableCellPadding + 2,
+            },
+        });
+
+        // Add header text if preset has headers
+        if (presetStyle.headerRows && presetStyle.headerRows > 0) {
+            for (let c = 0; c < tableCols; c++) {
+                const hCell = table.getCell(0, c);
+                if (hCell) {
+                    const headerText = `Header ${c + 1}`;
+                    hCell.story.insert(0, headerText);
+                    hCell.story.applyCharacterStyle(0, headerText.length, {
+                        fontSize: 12, fontWeight: 700,
+                        color: presetStyle.headerFillColor ? '#ffffff' : '#333333',
+                    });
+                }
+            }
+        }
+
+        const activeSt = activeStory ?? engineRef.current.story;
+        activeSt.insertInlineObject(offset, table);
+        setSelection([offset + 1, offset + 1]);
+        setActiveTableRef(table);
+        recompose();
+    }, [selection, recompose, activeStory, tableRows, tableCols, tablePreset, tableRowHeightMode, tableCellPadding]);
+
+    const handleAddRow = useCallback(() => {
+        if (!activeTableRef) return;
+        activeTableRef.addRow();
+        recompose();
+    }, [activeTableRef, recompose]);
+
+    const handleDeleteRow = useCallback(() => {
+        if (!activeTableRef) return;
+        activeTableRef.deleteRow(activeTableRef.rows - 1);
+        recompose();
+    }, [activeTableRef, recompose]);
+
+    const handleAddCol = useCallback(() => {
+        if (!activeTableRef) return;
+        activeTableRef.addColumn();
+        recompose();
+    }, [activeTableRef, recompose]);
+
+    const handleDeleteCol = useCallback(() => {
+        if (!activeTableRef) return;
+        activeTableRef.deleteColumn(activeTableRef.cols - 1);
+        recompose();
+    }, [activeTableRef, recompose]);
+
+    // ── JSON Loading ─────────────────────────────────────────────
+    const loadJSON = useCallback(async (text: string) => {
+        const engine = engineRef.current;
+        const uiRenderer = uiRendererRef.current;
+        const glRenderer = gpuRendererRef.current;
+        if (!engine || !uiRenderer || !glRenderer) return;
+
+        setIsLoadingJSON(true);
+        setStatus('Parsing JSON…');
+        setStatusDot('loading');
+        try {
+            const raw = JSON.parse(text) as unknown;
+            const doc = parseLSXMLJson(raw);
+
+            const pw = Math.round(doc.pageWidth);
+            const ph = Math.round(doc.pageHeight);
+
+            // Store graphic lines for overlay rendering
+            graphicLinesRef.current = doc.graphicLines ?? [];
+
+            // Pick the first story that has frames
+            const storyId = doc.mainStoryId;
+            const mainStory = doc.stories[storyId];
+            if (!mainStory) throw new Error('No main story found in JSON');
+
+            const mainFrames = doc.frames
+                .filter(f => f.storyId === storyId)
+                .sort((a, b) => {
+                    if (b.prevFrameId === a.id) return -1;
+                    if (a.prevFrameId === b.id) return 1;
+                    return a.x - b.x;
+                });
+
+            if (mainFrames.length === 0) throw new Error('No text frames found for main story');
+
+            const engineFrames = mainFrames.map(f => ({
+                id: f.id,
+                x: f.x,
+                y: f.y,
+                width: f.width,
+                height: f.height,
+                columns: f.columns,
+                columnGap: f.columnGap,
+                nextFrameId: f.nextFrameId,
+                prevFrameId: f.prevFrameId,
+                polygon: f.polygon,
+            }));
+
+            engine.updateConfig({
+                frames: engineFrames,
+                paperWidth: pw,
+                paperHeight: ph,
+                wrapObjects: [],
+                defaultCharacterStyle: {
+                    ...engine['_config'].defaultCharacterStyle,
+                    fontSize: 12,
+                    color: '#000000',
+                },
+                defaultParagraphStyle: {
+                    ...engine['_config'].defaultParagraphStyle,
+                    alignment: 'left',
+                    spaceBefore: 0,
+                    spaceAfter: 0,
+                    firstLineIndent: 0,
+                    composer: 'paragraph', // Knuth-Plass by default for JSON mode
+                    leading: 1.4,
+                },
+            });
+
+            engine.setText(mainStory.text);
+            const story = engine.story;
+
+            for (const span of mainStory.charSpans) {
+                if (span.end > span.start && Object.keys(span.style).length > 0) {
+                    story.applyCharacterStyle(span.start, span.end, span.style);
+                }
+            }
+
+            for (const span of mainStory.paraSpans) {
+                if (span.end > span.start && Object.keys(span.style).length > 0) {
+                    story.applyParagraphStyle(span.start, span.end, span.style);
+                }
+            }
+
+            // Register inline tables (U+FFFC placeholders are already in the text)
+            for (const obj of mainStory.inlineObjects ?? []) {
+                story.registerInlineObject(obj.offset, obj.table);
+            }
+
+            // Extend MSDF atlases to cover all characters present in the JSON text
+            if (msdfGenRef.current && robotoTTFRef.current) {
+                const currentCharset = baseCharsetRef.current;
+                const jsonChars = [...new Set(mainStory.text)].filter(c => !currentCharset.includes(c)).join('');
+                if (jsonChars.length > 0) {
+                    setStatus('Rebuilding glyph atlas for JSON text…');
+                    const extendedCharset = currentCharset + jsonChars;
+                    baseCharsetRef.current = extendedCharset;
+                    const newAtlas = await msdfGenRef.current.generateAtlas(robotoTTFRef.current.slice(0), extendedCharset, 4, [1024, 1024]);
+                    atlasRef.current = newAtlas;
+                    glRenderer.setAtlas(newAtlas);
+                    if (robotoBoldTTFRef.current && 'setBoldAtlas' in glRenderer) {
+                        const newBoldAtlas = await msdfGenRef.current.generateAtlas(robotoBoldTTFRef.current.slice(0), extendedCharset, 4, [1024, 1024]);
+                        boldAtlasRef.current = newBoldAtlas;
+                        (glRenderer as import('../renderer/WebGLRenderer').WebGLRenderer).setBoldAtlas(newBoldAtlas);
+                    }
+                }
+            }
+
+            uiRenderer.updateConfig({ paperWidth: pw, paperHeight: ph, drawText: canvas2DTextRef.current });
+            if ('setPaperSize' in glRenderer) {
+                (glRenderer as import('../renderer/WebGLRenderer').WebGLRenderer).setPaperSize(pw, ph);
+            }
+
+            setPaperWidth(pw);
+            setPaperHeight(ph);
+            setIsJSONMode(true);
+            setPolygons([]);
+            setSelection(null);
+            setActiveStory(null);
+
+            // Auto-fit zoom: calculate zoom so page width fits the canvas area
+            const canvasAreaEl = document.querySelector('.canvas-area');
+            const areaW = canvasAreaEl ? canvasAreaEl.clientWidth - 40 : window.innerWidth - 320;
+            const areaH = canvasAreaEl ? canvasAreaEl.clientHeight - 40 : window.innerHeight - 76;
+            const fitZoom = Math.max(0.05, Math.min(2.0, Math.min(areaW / pw, areaH / ph)));
+            // Round to nearest 5% for a clean zoom value
+            const snappedZoom = Math.round(fitZoom * 20) / 20;
+            setZoom(snappedZoom);
+            setPanX(0);
+            setPanY(0);
+
+            const result = engine.compose();
+            setLayoutResult(result);
+            glRenderer.setTransform(snappedZoom, 0, 0);
+            glRenderer.render(result, atlasRef.current);
+            uiRenderer.render(result, engine.frameManager.allFrames, null, [], glRenderer.getCanvas(), snappedZoom, undefined);
+            if (graphicLinesRef.current.length > 0) {
+                uiRenderer.drawGraphicLines(graphicLinesRef.current);
+            }
+            setStatus(`JSON loaded — ${result.lineCount} lines in ${result.composeTimeMs.toFixed(1)}ms`);
+            setStatusDot('ok');
+        } catch (err) {
+            console.error('JSON load failed:', err);
+            setStatus(`JSON error: ${err instanceof Error ? err.message : 'Unknown'}`);
+            setStatusDot('error');
+        } finally {
+            setIsLoadingJSON(false);
+        }
+    }, [zoom, setActiveStory]);
+
+    const handleLoadJSONFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        file.text().then(text => loadJSON(text));
+        e.target.value = '';
+    }, [loadJSON]);
+
     // ── Initialization ──────────────────────────────────────────
     useEffect(() => {
         let cancelled = false;
@@ -287,11 +580,40 @@ export function App() {
                 msdfGenRef.current = new MSDFAtlasGenerator();
                 await msdfGenRef.current.init();
 
-                // For MVP, generate a static atlas containing all ASCII + specific chars used.
-                const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:",./<>? \'’—';
-                const robotoBlob = await (await fetch('https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf')).arrayBuffer();
+                // Charset: ASCII + common Unicode chars + Latin-1 supplement + OpenType liga codepoints
+                const charset = [
+                    'abcdefghijklmnopqrstuvwxyz',
+                    'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                    "0123456789!@#$%^&*()_+-=[]{}|;:\",./<>? '",
+                    '\u2014\u2013\u2011',   // em dash, en dash, non-breaking hyphen
+                    '\u2018\u2019\u201C\u201D', // smart quotes
+                    '\u00AE\u00A9\u2122',   // registered, copyright, trademark
+                    '\u2022\u00B0\u00B5\u00A0', // bullet, degree, micro, nbsp
+                    '\uFB00\uFB01\uFB02\uFB03\uFB04', // ff fi fl ffi ffl ligatures
+                    // Latin-1 supplement (accented chars common in EU pharmaceutical docs)
+                    '\u00C0\u00C1\u00C2\u00C3\u00C4\u00C5\u00C6\u00C7\u00C8\u00C9\u00CA\u00CB',
+                    '\u00CC\u00CD\u00CE\u00CF\u00D0\u00D1\u00D2\u00D3\u00D4\u00D5\u00D6\u00D8',
+                    '\u00D9\u00DA\u00DB\u00DC\u00DD\u00DE\u00DF',
+                    '\u00E0\u00E1\u00E2\u00E3\u00E4\u00E5\u00E6\u00E7\u00E8\u00E9\u00EA\u00EB',
+                    '\u00EC\u00ED\u00EE\u00EF\u00F0\u00F1\u00F2\u00F3\u00F4\u00F5\u00F6\u00F8',
+                    '\u00F9\u00FA\u00FB\u00FC\u00FD\u00FE\u00FF',
+                ].join('');
+                const [robotoBlob, robotoBoldBlob] = await Promise.all([
+                    fetch('https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Regular.ttf').then(r => r.arrayBuffer()),
+                    fetch('https://raw.githubusercontent.com/googlefonts/roboto/main/src/hinted/Roboto-Bold.ttf').then(r => r.arrayBuffer()),
+                ]);
 
-                atlasRef.current = await msdfGenRef.current.generateAtlas(robotoBlob, charset, 4, [1024, 1024]);
+                // Cache TTF bytes for dynamic atlas regeneration when JSON is loaded
+                robotoTTFRef.current = robotoBlob.slice(0);
+                robotoBoldTTFRef.current = robotoBoldBlob.slice(0);
+                baseCharsetRef.current = charset;
+
+                setStatus('Generating Regular MSDF atlas…');
+                const regularAtlas = await msdfGenRef.current.generateAtlas(robotoBlob, charset, 4, [1024, 1024]);
+                atlasRef.current = regularAtlas;
+                setStatus('Generating Bold MSDF atlas…');
+                const boldAtlas = await msdfGenRef.current.generateAtlas(robotoBoldBlob.slice(0), charset, 4, [1024, 1024]);
+                boldAtlasRef.current = boldAtlas;
 
                 if (uiCanvasRef.current) {
                     const uiRenderer = new CanvasRenderer(uiCanvasRef.current, {
@@ -308,36 +630,33 @@ export function App() {
                     offscreenCanvas.width = config.paperWidth;
                     offscreenCanvas.height = config.paperHeight;
 
-                    // Try WebGPU first, fall back to WebGL
+                    // Try WebGPU → WebGL 2 → Canvas 2D fallback
+                    // Backend selection: WebGL 2 → Canvas 2D
+                    // Use try/catch instead of isSupported() — some Linux/software-render
+                    // environments pass the static check but still fail to create the context,
+                    // or vice versa (static probe fails but actual creation works).
                     let gpuRenderer: IGPURenderer;
-                    if (isWebGPUAvailable()) {
-                        setStatus('Initializing WebGPU...');
-                        const webgpuRenderer = new WebGPURenderer(offscreenCanvas, {
-                            paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
-                            paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
-                        });
-                        const ok = await webgpuRenderer.init();
-                        if (ok) {
-                            gpuRenderer = webgpuRenderer;
-                            setGpuBackend('webgpu');
-                        } else {
-                            // WebGPU init failed, fall back
-                            gpuRenderer = new WebGLRenderer(offscreenCanvas, {
-                                paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
-                                paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
-                            });
-                            setGpuBackend('webgl');
-                        }
-                    } else {
+
+                    try {
                         gpuRenderer = new WebGLRenderer(offscreenCanvas, {
                             paperWidth: DEFAULT_ENGINE_CONFIG.paperWidth,
                             paperHeight: DEFAULT_ENGINE_CONFIG.paperHeight,
                         });
                         setGpuBackend('webgl');
+                        canvas2DTextRef.current = false;
+                    } catch {
+                        // WebGL 2 unavailable — fall back to Canvas 2D text rendering
+                        gpuRenderer = new NullGPURenderer();
+                        setGpuBackend('canvas2d');
+                        canvas2DTextRef.current = true;
+                        uiRenderer.updateConfig({ drawText: true });
                     }
 
-                    // Upload the generated MSDF atlas texture
+                    // Upload the generated MSDF atlas textures
                     gpuRenderer.setAtlas(atlasRef.current);
+                    if (boldAtlasRef.current && 'setBoldAtlas' in gpuRenderer) {
+                        (gpuRenderer as import('../renderer/WebGLRenderer').WebGLRenderer).setBoldAtlas(boldAtlasRef.current);
+                    }
 
                     gpuRendererRef.current = gpuRenderer;
 
@@ -359,7 +678,6 @@ export function App() {
         }
         init();
         return () => { cancelled = true; };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Recompose when config changes
@@ -376,17 +694,22 @@ export function App() {
                 selection,
                 activeWrapObjects,
                 gpuRendererRef.current.getCanvas(),
-                zoom
+                zoom,
+                activeStory ?? undefined
             );
+            if (graphicLinesRef.current.length > 0) {
+                uiRendererRef.current.drawGraphicLines(graphicLinesRef.current);
+            }
             if (drawPoints.length > 0) {
                 uiRendererRef.current.drawPolygonInProgress(drawPoints, cursorPt, SNAP_RADIUS);
             }
         }
         if (engineRef.current && selection) {
+            const story = activeStory ?? engineRef.current.story;
             const offset = Math.min(selection[0], selection[1]);
-            if (offset < engineRef.current.story.text.length) {
-                const charStyle = engineRef.current.story.getCharacterStyleAt(offset);
-                const paraStyle = engineRef.current.story.getParagraphStyleAt(offset);
+            if (offset < story.text.length) {
+                const charStyle = story.getCharacterStyleAt(offset);
+                const paraStyle = story.getParagraphStyleAt(offset);
                 setFontSize(charStyle.fontSize);
                 setFontWeight(charStyle.fontWeight);
                 setFontStyle(charStyle.fontStyle);
@@ -398,7 +721,7 @@ export function App() {
                 setTolerance(paraStyle.tolerance);
             }
         }
-    }, [selection, layoutResult, activeWrapObjects, drawPoints, cursorPt, zoom]);
+    }, [selection, layoutResult, activeWrapObjects, drawPoints, cursorPt, zoom, activeStory]);
 
     // ── Canvas draw-mode pointer handlers ───────────────────────
     const handleCanvasPointerDown = useCallback((e: React.PointerEvent) => {
@@ -407,13 +730,17 @@ export function App() {
             if (!engineRef.current) return;
             const pt = canvasPoint(e.clientX, e.clientY);
             if (!pt) return;
-            const offset = engineRef.current.hitTest(pt.x, pt.y);
-            if (offset !== -1) {
-                setSelection([offset, offset]);
+            const hit = engineRef.current.hitTest(pt.x, pt.y);
+            if (hit) {
+                setActiveStory(hit.story);
+                setSelection([hit.offset, hit.offset]);
                 setIsDragging(true);
                 uiCanvasRef.current?.setPointerCapture(e.pointerId);
+                // Ensure canvas area has focus for keyboard events
+                ((e.currentTarget as HTMLElement).closest('.canvas-area') as HTMLElement | null)?.focus();
             } else {
                 setSelection(null);
+                setActiveStory(null);
             }
             return;
         }
@@ -456,9 +783,12 @@ export function App() {
         if (!isDragging || !engineRef.current || !selection) return;
         const pt = canvasPoint(e.clientX, e.clientY);
         if (!pt) return;
-        const offset = engineRef.current.hitTest(pt.x, pt.y);
-        if (offset !== -1) setSelection([selection[0], offset]);
-    }, [drawMode, isDragging, selection, canvasPoint, layoutResult, drawPoints, activeWrapObjects]);
+        const hit = engineRef.current.hitTest(pt.x, pt.y);
+        // Only extend selection if dragging in the SAME story
+        if (hit && activeStory === hit.story) {
+            setSelection([selection[0], hit.offset]);
+        }
+    }, [drawMode, isDragging, selection, canvasPoint, layoutResult, drawPoints, activeWrapObjects, activeStory]);
 
     const handleCanvasDoubleClick = useCallback((e: React.MouseEvent) => {
         if (!drawMode) return;
@@ -487,18 +817,22 @@ export function App() {
             return;
         }
 
-        if (!engineRef.current || !selection || drawMode) return;
+        if (!engineRef.current || drawMode) return;
+        if (!selection) return;
         const engine = engineRef.current;
-        const story = engine.story;
+        const story = activeStoryRef.current ?? engine.story;
         const [s1, s2] = selection;
-        let start = Math.min(s1, s2);
-        let end = Math.max(s1, s2);
-        let hasSelection = start !== end;
+        let start = Math.max(0, Math.min(s1, s2));
+        let end = Math.min(story.length, Math.max(s1, s2));
+        // If stale selection completely out of bounds from rapid typing, clamp it:
+        if (start > story.length) start = story.length;
+        if (end < start) end = start;
+        const hasSelection = start !== end;
 
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
             e.preventDefault();
             if (e.shiftKey) story.redo(); else story.undo();
-            recompose(); return;
+            recomposeDeferred(); return;
         }
         if (e.key === 'ArrowLeft') {
             e.preventDefault();
@@ -516,13 +850,13 @@ export function App() {
             e.preventDefault();
             if (hasSelection) { story.delete(start, end - start); setSelection([start, start]); }
             else if (start > 0) { story.delete(start - 1, 1); setSelection([start - 1, start - 1]); }
-            recompose(); return;
+            recomposeDeferred(); return;
         }
         if (e.key === 'Delete') {
             e.preventDefault();
             if (hasSelection) { story.delete(start, end - start); setSelection([start, start]); }
             else if (start < story.length) { story.delete(start, 1); setSelection([start, start]); }
-            recompose(); return;
+            recomposeDeferred(); return;
         }
         // Zoom keyboard shortcuts
         if ((e.metaKey || e.ctrlKey) && (e.key === '=' || e.key === '+')) {
@@ -547,9 +881,9 @@ export function App() {
             if (hasSelection) story.delete(start, end - start);
             story.insert(start, char);
             setSelection([start + 1, start + 1]);
-            recompose();
+            recomposeDeferred();
         }
-    }, [drawMode, drawPoints, cancelDraw, finishPolygon, selection, recompose]);
+    }, [drawMode, drawPoints, cancelDraw, finishPolygon, selection, recompose, recomposeDeferred, activeStory]);
 
     // ── Zoom / Pan handlers ──────────────────────────────────────
     // Use a ref to track zoom/pan for zoom-to-cursor math (avoids stale closures)
@@ -652,6 +986,22 @@ export function App() {
                     <span className="sidebar__version">v0.1</span>
                 </div>
 
+                {/* JSON Import */}
+                <div className="control-group">
+                    <label className="control-group__label">JSON Import</label>
+                    <label style={{ display: 'block', cursor: 'pointer' }}>
+                        <div style={{ width: '100%', padding: '7px 8px', fontSize: '13px', fontWeight: 600, background: isJSONMode ? '#1a6b3a' : 'var(--accent-primary)', color: '#fff', border: 'none', borderRadius: '6px', textAlign: 'center', cursor: 'pointer', marginBottom: '6px', opacity: isLoadingJSON ? 0.6 : 1 }}>
+                            {isLoadingJSON ? '⏳ Loading…' : isJSONMode ? '✓ JSON Loaded' : '📋 Open JSON file…'}
+                        </div>
+                        <input type="file" accept=".json" style={{ display: 'none' }} onChange={handleLoadJSONFile} disabled={isLoadingJSON} />
+                    </label>
+                    {isJSONMode && (
+                        <div style={{ fontSize: '11px', color: '#63cab7', marginTop: '4px' }}>
+                            {paperWidth}×{paperHeight} pt · Knuth-Plass composer
+                        </div>
+                    )}
+                </div>
+
                 {/* Composer */}
                 <div className="control-group">
                     <label className="control-group__label">Composer</label>
@@ -703,6 +1053,80 @@ export function App() {
                     <input type="range" min={0} max={60} step={2} value={columnGap} onChange={(e) => setColumnGap(Number(e.target.value))} />
                 </div>
 
+                {/* Table Controls */}
+                <div className="control-group">
+                    <label className="control-group__label">Table</label>
+
+                    {/* Preset selector */}
+                    <div className="control-row">
+                        <span className="control-row__name">Style</span>
+                        <select value={tablePreset} onChange={(e) => setTablePreset(e.target.value as TablePreset)}
+                            style={{ flex: 1, background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', padding: '3px 6px', fontSize: '12px' }}>
+                            <option value="plain">Plain</option>
+                            <option value="striped">Striped</option>
+                            <option value="headerStriped">Header + Striped</option>
+                            <option value="darkHeader">Dark Header</option>
+                        </select>
+                    </div>
+
+                    {/* Rows & Cols */}
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '2px' }}>Rows</div>
+                            <input type="number" min={1} max={20} value={tableRows}
+                                onChange={(e) => setTableRows(Math.max(1, Math.min(20, Number(e.target.value))))}
+                                style={{ width: '100%', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', padding: '3px 6px', fontSize: '12px' }} />
+                        </div>
+                        <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '2px' }}>Cols</div>
+                            <input type="number" min={1} max={10} value={tableCols}
+                                onChange={(e) => setTableCols(Math.max(1, Math.min(10, Number(e.target.value))))}
+                                style={{ width: '100%', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', padding: '3px 6px', fontSize: '12px' }} />
+                        </div>
+                    </div>
+
+                    {/* Row Height Mode */}
+                    <div className="control-row" style={{ marginTop: '4px' }}>
+                        <span className="control-row__name">Height</span>
+                        <select value={tableRowHeightMode} onChange={(e) => setTableRowHeightMode(e.target.value as RowHeightMode)}
+                            style={{ flex: 1, background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', padding: '3px 6px', fontSize: '12px' }}>
+                            <option value="atLeast">At Least</option>
+                            <option value="exactly">Exactly</option>
+                        </select>
+                    </div>
+
+                    {/* Cell Padding */}
+                    <div className="control-row" style={{ marginTop: '4px' }}>
+                        <span className="control-row__name">Padding</span>
+                        <span className="control-row__value">{tableCellPadding}px</span>
+                    </div>
+                    <input type="range" min={0} max={20} step={1} value={tableCellPadding}
+                        onChange={(e) => setTableCellPadding(Number(e.target.value))} />
+
+                    {/* Insert Button */}
+                    <button
+                        onClick={insertTable}
+                        disabled={!selection}
+                        style={{ marginTop: '6px', padding: '7px 8px', fontSize: '13px', fontWeight: 600, background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', width: '100%', opacity: selection ? 1 : 0.5 }}
+                    >
+                        ⊞ Insert {tableRows}×{tableCols} Table
+                    </button>
+                    {!selection && <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '4px' }}>Click in text to insert</div>}
+
+                    {/* Row/Col Operations (shown when a table is active) */}
+                    {activeTableRef && (
+                        <div style={{ marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                            <button onClick={handleAddRow} style={{ flex: 1, padding: '4px', fontSize: '11px', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', cursor: 'pointer' }}>+ Row</button>
+                            <button onClick={handleDeleteRow} style={{ flex: 1, padding: '4px', fontSize: '11px', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', cursor: 'pointer' }}>− Row</button>
+                            <button onClick={handleAddCol} style={{ flex: 1, padding: '4px', fontSize: '11px', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', cursor: 'pointer' }}>+ Col</button>
+                            <button onClick={handleDeleteCol} style={{ flex: 1, padding: '4px', fontSize: '11px', background: 'var(--bg-surface)', color: 'var(--text-primary)', border: '1px solid var(--border-subtle)', borderRadius: '4px', cursor: 'pointer' }}>− Col</button>
+                            <div style={{ width: '100%', fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                                Active: {activeTableRef.rows}×{activeTableRef.cols}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
                 {/* Display */}
                 <div className="control-group">
                     <label className="control-group__label">Display</label>
@@ -720,7 +1144,7 @@ export function App() {
                 </div>
 
                 {/* ── Wrap Polygons ─────────────────────────────── */}
-                <div className="control-group">
+                {!isJSONMode && <div className="control-group">
                     <label className="control-group__label">Wrap Polygons</label>
 
                     {/* Draw tool toggle */}
@@ -792,7 +1216,7 @@ export function App() {
                             </div>
                         </div>
                     ))}
-                </div>
+                </div>}
 
                 {/* Stats */}
                 {layoutResult && (
@@ -801,7 +1225,7 @@ export function App() {
                         <div className="control-row"><span className="control-row__name">Lines</span><span className="control-row__value">{layoutResult.lineCount}</span></div>
                         <div className="control-row"><span className="control-row__name">Glyphs</span><span className="control-row__value">{layoutResult.glyphCount}</span></div>
                         <div className="control-row"><span className="control-row__name">Layout Time</span><span className="control-row__value">{layoutResult.composeTimeMs.toFixed(1)}ms</span></div>
-                        <div className="control-row"><span className="control-row__name">Polygons</span><span className="control-row__value">{polygons.filter(p => p.enabled).length}/{polygons.length}</span></div>
+                        {!isJSONMode && <div className="control-row"><span className="control-row__name">Polygons</span><span className="control-row__value">{polygons.filter(p => p.enabled).length}/{polygons.length}</span></div>}
                     </div>
                 )}
             </aside>
@@ -827,8 +1251,8 @@ export function App() {
                     key="webgl-fix-remount"
                     style={{
                         position: 'relative',
-                        width: DEFAULT_ENGINE_CONFIG.paperWidth * zoom,
-                        height: DEFAULT_ENGINE_CONFIG.paperHeight * zoom,
+                        width: paperWidth * zoom,
+                        height: paperHeight * zoom,
                         background: '#ffffff',
                         boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
                         overflow: 'hidden',
@@ -838,7 +1262,7 @@ export function App() {
                     {/* Only the Canvas2D is in the DOM to avoid compositing bugs. It will paint the WebGL output natively. */}
                     <canvas
                         ref={uiCanvasRef}
-                        style={{ position: 'absolute', top: 0, left: 0, width: DEFAULT_ENGINE_CONFIG.paperWidth * zoom, height: DEFAULT_ENGINE_CONFIG.paperHeight * zoom, zIndex: 2, touchAction: 'none', cursor: canvasCursor, pointerEvents: 'auto' }}
+                        style={{ position: 'absolute', top: 0, left: 0, width: paperWidth * zoom, height: paperHeight * zoom, zIndex: 2, touchAction: 'none', cursor: canvasCursor, pointerEvents: 'auto' }}
                     />
                 </div>
             </main>
@@ -856,7 +1280,7 @@ export function App() {
                     {composer === 'paragraph' ? 'Knuth-Plass' : 'Greedy'} Composer
                 </div>
                 <div className="status-bar__item" style={{ opacity: 0.7, fontSize: '11px' }}>
-                    {gpuBackend === 'webgpu' ? '🟢 WebGPU' : '🔵 WebGL'}
+                    {gpuBackend === 'webgl' ? '🔵 WebGL' : '⬜ Canvas 2D'}
                 </div>
                 {drawMode && (
                     <div className="status-bar__item" style={{ color: '#63cab7', fontWeight: 600 }}>

@@ -15,6 +15,7 @@ import {
 import type {
     CharacterStyle,
     ParagraphStyle,
+    InlineObject,
 } from '../types';
 
 /** A span of character styling applied to a range of text */
@@ -49,6 +50,7 @@ export class Story {
     private _undoStack: EditOperation[];
     private _redoStack: EditOperation[];
     private _listeners: Set<StoryChangeListener>;
+    private _inlineObjects: Map<number, InlineObject>;
     private _defaultCharStyle: CharacterStyle;
     private _defaultParaStyle: ParagraphStyle;
     private _version: number;
@@ -64,6 +66,7 @@ export class Story {
         this._undoStack = [];
         this._redoStack = [];
         this._listeners = new Set();
+        this._inlineObjects = new Map();
         this._defaultCharStyle = defaultCharStyle ?? { ...DEFAULT_CHARACTER_STYLE };
         this._defaultParaStyle = defaultParaStyle ?? { ...DEFAULT_PARAGRAPH_STYLE };
         this._version = 0;
@@ -117,6 +120,19 @@ export class Story {
             if (pb.offset > offset) {
                 pb.offset += text.length;
             }
+        }
+
+        // Shift inline objects
+        if (this._inlineObjects.size > 0 && text.length > 0) {
+            const newObjects = new Map<number, InlineObject>();
+            for (const [objOffset, obj] of this._inlineObjects.entries()) {
+                if (objOffset >= offset) {
+                    newObjects.set(objOffset + text.length, obj);
+                } else {
+                    newObjects.set(objOffset, obj);
+                }
+            }
+            this._inlineObjects = newObjects;
         }
 
         // Check for new paragraph breaks in inserted text
@@ -183,6 +199,20 @@ export class Story {
                 return null; // Removed by deletion
             })
             .filter((pb): pb is ParagraphBoundary => pb !== null);
+
+        // Shift or remove inline objects
+        if (this._inlineObjects.size > 0 && count > 0) {
+            const newObjects = new Map<number, InlineObject>();
+            for (const [objOffset, obj] of this._inlineObjects.entries()) {
+                if (objOffset < offset) {
+                    newObjects.set(objOffset, obj);
+                } else if (objOffset >= offset + count) {
+                    newObjects.set(objOffset - count, obj);
+                }
+                // Objects strictly inside the [offset, offset+count] range are deleted
+            }
+            this._inlineObjects = newObjects;
+        }
 
         // Ensure offset 0 always has a boundary
         if (this._paragraphBoundaries.length === 0 || this._paragraphBoundaries[0]!.offset !== 0) {
@@ -253,6 +283,39 @@ export class Story {
             }
         }
         return result;
+    }
+
+    // ── Inline Objects ──
+
+    /** Insert an inline object at the specified offset */
+    insertInlineObject(offset: number, object: InlineObject): void {
+        // First insert the object replacement character
+        this.insert(offset, '\uFFFC');
+        // Then register the object at the newly shifted offset
+        this._inlineObjects.set(offset, object);
+        this._version++;
+        this._notifyListeners();
+    }
+
+    /**
+     * Register an inline object at an existing U+FFFC placeholder character.
+     * Unlike insertInlineObject(), does NOT insert a new character — used when
+     * the placeholder is already present in the story text (e.g. from IDML parsing).
+     */
+    registerInlineObject(offset: number, object: InlineObject): void {
+        this._inlineObjects.set(offset, object);
+        this._version++;
+        this._notifyListeners();
+    }
+
+    /** Retrieve all inline objects currently in the story */
+    getInlineObjects(): Map<number, InlineObject> {
+        return this._inlineObjects;
+    }
+
+    /** Retrieve a specific inline object at an offset */
+    getInlineObjectAt(offset: number): InlineObject | undefined {
+        return this._inlineObjects.get(offset);
     }
 
     // ── Paragraph Utilities ──
